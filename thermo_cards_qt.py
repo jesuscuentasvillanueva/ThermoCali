@@ -7,7 +7,7 @@ import csv
 from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QFrame, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QGridLayout, QGroupBox, QDialog, QTabWidget, QToolBar, QAction, QStyle, QSizePolicy, QStyleFactory, QGraphicsDropShadowEffect, QDateTimeEdit, QListWidget, QListWidgetItem
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QDateTime
-from PyQt5.QtGui import QPalette, QColor
+from PyQt5.QtGui import QPalette, QColor, QPainter, QPen, QFont, QPainterPath
 from pymodbus.client import ModbusSerialClient
 from serial.tools import list_ports
 
@@ -30,7 +30,8 @@ def default_config():
             "enabled": False,
             "folder": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
             "mode": "per_variable",
-            "separator": ","
+            "separator": ",",
+            "interval_sec": 10.0
         }
     }
 
@@ -146,7 +147,7 @@ class VariableCard(QFrame):
         self.var = var
         self.setFrameShape(QFrame.Panel)
         self.setFrameShadow(QFrame.Raised)
-        self.setStyleSheet("QFrame{border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;} QPushButton{padding:8px 12px;border:1px solid #e5e7eb;border-radius:8px;background:#f8fafc;} QPushButton:hover{background:#f1f5f9;}")
+        self.setStyleSheet("QFrame{border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;} QPushButton{padding:10px 14px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;font-weight:600;} QPushButton:hover{background:#f1f5f9;}")
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(18)
         shadow.setOffset(0, 4)
@@ -155,7 +156,7 @@ class VariableCard(QFrame):
         v = QVBoxLayout(self)
         h = QHBoxLayout()
         self.title = QLabel(self.var.get("name", "Temperatura"))
-        self.title.setStyleSheet("font-weight:700;font-size:18px;color:#0f172a;")
+        self.title.setStyleSheet("font-weight:700;font-size:20px;color:#0f172a;")
         self.status = QLabel("●")
         self.status.setStyleSheet("color:gray;font-size:14px;")
         h.addWidget(self.title)
@@ -164,9 +165,9 @@ class VariableCard(QFrame):
         v.addLayout(h)
         c = QHBoxLayout()
         self.value_label = QLabel("--")
-        self.value_label.setStyleSheet("font-size:34px;font-weight:700;color:#0f172a;")
+        self.value_label.setStyleSheet("font-size:40px;font-weight:700;color:#0f172a;")
         self.unit_label = QLabel(self.var.get("unit", "°C"))
-        self.unit_label.setStyleSheet("font-size:14px;color:#475569;background:#eef2ff;border-radius:10px;padding:2px 8px;")
+        self.unit_label.setStyleSheet("font-size:16px;color:#334155;background:#e2efff;border-radius:12px;padding:4px 10px;")
         c.addWidget(self.value_label)
         c.addWidget(self.unit_label)
         c.addStretch(1)
@@ -178,7 +179,7 @@ class VariableCard(QFrame):
         self.chip_shift = QLabel("")
         self.chip_scale = QLabel("")
         for ch in [self.chip_slave, self.chip_type, self.chip_addr, self.chip_shift, self.chip_scale]:
-            ch.setStyleSheet("color:#334155;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:2px 8px;font-size:12px;")
+            ch.setStyleSheet("color:#334155;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:3px 10px;font-size:13px;")
             chips.addWidget(ch)
         chips.addStretch(1)
         v.addLayout(chips)
@@ -268,6 +269,8 @@ class PollingWorker(QThread):
             now = time.monotonic()
             vars_snapshot = list(self.variables)
             idle = True
+            next_wake = None
+            groups = {}
             for var in vars_snapshot:
                 if not var.get("enabled", True):
                     continue
@@ -275,21 +278,43 @@ class PollingWorker(QThread):
                 interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
                 due = self.next_due.get(vid, 0)
                 if now < due:
+                    if next_wake is None or due < next_wake:
+                        next_wake = due
                     continue
                 idle = False
+                key = (int(var.get("slave",1)), var.get("type","holding"), int(var.get("address",0)))
+                lst = groups.get(key)
+                if lst is None:
+                    lst = []
+                    groups[key] = lst
+                lst.append(var)
+            for key, vlist in groups.items():
+                slave, typ, addr = key
                 try:
-                    raw, value = self.read_var(var)
-                    self.value_updated.emit(vid, value, raw)
-                    try:
-                        self.logger.log(var, raw, value)
-                    except Exception:
-                        pass
-                    self.next_due[vid] = time.monotonic() + interval
+                    reg = self.read_raw(slave, typ, addr)
+                    for var in vlist:
+                        vid = var.get("id")
+                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
+                        value = self.convert_value(var, reg)
+                        self.value_updated.emit(vid, value, reg)
+                        try:
+                            self.logger.log(var, reg, value)
+                        except Exception:
+                            pass
+                        self.next_due[vid] = time.monotonic() + interval
                 except Exception as e:
-                    self.error.emit(vid, str(e))
-                    self.next_due[vid] = time.monotonic() + interval
+                    for var in vlist:
+                        vid = var.get("id")
+                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
+                        self.error.emit(vid, str(e))
+                        self.next_due[vid] = time.monotonic() + interval
             if idle:
-                time.sleep(0.05)
+                sleep_for = 0.005
+                if next_wake is not None:
+                    remaining = next_wake - time.monotonic()
+                    if remaining > 0:
+                        sleep_for = min(0.01, remaining)
+                time.sleep(sleep_for)
         try:
             self.client.close()
         except Exception:
@@ -302,29 +327,36 @@ class PollingWorker(QThread):
         addr = int(var.get("address", 0))
         slave = int(var.get("slave", 1))
         typ = var.get("type", "holding")
-        dtype = var.get("data_type", "uint16")
+        reg = self.read_raw(slave, typ, addr)
+        value = self.convert_value(var, reg)
+        return reg, value
+
+    def read_raw(self, slave, typ, addr):
         if typ == "holding":
             resp = self.client.read_holding_registers(address=addr, count=1, slave=slave)
         else:
             resp = self.client.read_input_registers(address=addr, count=1, slave=slave)
         if hasattr(resp, "isError") and resp.isError():
             raise RuntimeError(str(resp))
-        reg = int(resp.registers[0])
-        if dtype == "int16":
-            if reg > 32767:
-                reg = reg - 65536
+        return int(resp.registers[0])
+
+    def convert_value(self, var, reg):
+        dtype = var.get("data_type", "uint16")
+        r = int(reg)
+        if dtype == "int16" and r > 32767:
+            r = r - 65536
         scale = float(var.get("scale", 1.0))
         offset = float(var.get("offset", 0.0))
         shift = int(var.get("decimal_shift", 0))
         factor = (10.0 ** (-shift)) if shift != 0 else 1.0
-        value = reg * factor * scale + offset
-        return int(resp.registers[0]), value
+        return r * factor * scale + offset
 
 
 class CSVLogger:
     def __init__(self, cfg):
         self.update_config(cfg)
         self._vars = []
+        self._last_ts = {}
 
     def update_config(self, cfg):
         self.cfg = cfg or {}
@@ -332,6 +364,10 @@ class CSVLogger:
         self.folder = self.cfg.get("folder") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         self.mode = self.cfg.get("mode", "per_variable")  # daily | single | per_variable
         self.sep = self.cfg.get("separator", ",")
+        try:
+            self.interval_sec = float(self.cfg.get("interval_sec", 10.0))
+        except Exception:
+            self.interval_sec = 10.0
         try:
             os.makedirs(self.folder, exist_ok=True)
         except Exception:
@@ -357,6 +393,17 @@ class CSVLogger:
         if not self.enabled:
             return
         ts = datetime.now()
+        # Throttle by interval per variable id
+        try:
+            vid = var.get("id")
+            if vid:
+                last = self._last_ts.get(vid)
+                if self.interval_sec and self.interval_sec > 0 and last is not None:
+                    if (ts - last).total_seconds() < self.interval_sec:
+                        return
+                self._last_ts[vid] = ts
+        except Exception:
+            pass
         path = self._file_for(var, ts)
         try:
             is_new = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -412,7 +459,7 @@ class VariableForm(QFrame):
         self.dec_shift_spin = QSpinBox(); self.dec_shift_spin.setRange(-9,9); self.dec_shift_spin.setSingleStep(1); self.dec_shift_spin.setValue(int(self.var.get("decimal_shift",0)))
         self.offset_spin = QDoubleSpinBox(); self.offset_spin.setDecimals(6); self.offset_spin.setRange(-1e6,1e6); self.offset_spin.setSingleStep(0.1); self.offset_spin.setValue(float(self.var.get("offset",0.0)))
         self.decimals_spin = QSpinBox(); self.decimals_spin.setRange(0,6); self.decimals_spin.setValue(int(self.var.get("decimals",1)))
-        self.interval_spin = QSpinBox(); self.interval_spin.setRange(100,60000); self.interval_spin.setSingleStep(100); self.interval_spin.setValue(int(self.var.get("poll_interval_ms",1000)))
+        self.interval_spin = QSpinBox(); self.interval_spin.setRange(50,60000); self.interval_spin.setSingleStep(50); self.interval_spin.setValue(int(self.var.get("poll_interval_ms",1000)))
         self.enabled_check = QCheckBox("Activo"); self.enabled_check.setChecked(bool(self.var.get("enabled",True)))
         fields = [
             ("Esclavo", self.slave_spin),
@@ -480,8 +527,8 @@ class SettingsDialog(QDialog):
         self.parity_combo = QComboBox(); self.parity_combo.addItems(["N","E","O"]) 
         self.stop_combo = QComboBox(); self.stop_combo.addItems(["1","2"]) 
         self.byte_combo = QComboBox(); self.byte_combo.addItems(["7","8"]) 
-        self.timeout_spin = QDoubleSpinBox(); self.timeout_spin.setRange(0.1,10.0); self.timeout_spin.setSingleStep(0.1)
-        self.global_poll_spin = QSpinBox(); self.global_poll_spin.setRange(100,60000); self.global_poll_spin.setSingleStep(100)
+        self.timeout_spin = QDoubleSpinBox(); self.timeout_spin.setRange(0.02,10.0); self.timeout_spin.setSingleStep(0.02)
+        self.global_poll_spin = QSpinBox(); self.global_poll_spin.setRange(50,60000); self.global_poll_spin.setSingleStep(50)
         ser = self._cfg.get("serial", {})
         self.port_combo.setCurrentText(ser.get("port", "COM3"))
         self.baud_combo.setCurrentText(str(ser.get("baudrate", 9600)))
@@ -526,10 +573,12 @@ class SettingsDialog(QDialog):
         self.log_browse = QPushButton("Examinar…")
         self.log_mode = QComboBox(); self.log_mode.addItems(["per_variable","daily","single"]); self.log_mode.setCurrentText(log.get("mode","per_variable"))
         self.log_sep = QComboBox(); self.log_sep.addItems([",",";","\t"]); self.log_sep.setCurrentText(log.get("separator", ","))
+        self.log_interval = QDoubleSpinBox(); self.log_interval.setDecimals(1); self.log_interval.setRange(0.0, 3600.0); self.log_interval.setSingleStep(0.5); self.log_interval.setValue(float(log.get("interval_sec", 10.0)))
         g.addWidget(self.log_enabled, 0, 0, 1, 2)
         g.addWidget(QLabel("Carpeta"), 1, 0); g.addWidget(self.log_folder, 1, 1); g.addWidget(self.log_browse, 1, 2)
         g.addWidget(QLabel("Modo"), 2, 0); g.addWidget(self.log_mode, 2, 1)
         g.addWidget(QLabel("Separador"), 3, 0); g.addWidget(self.log_sep, 3, 1)
+        g.addWidget(QLabel("Intervalo de guardado (s)"), 4, 0); g.addWidget(self.log_interval, 4, 1)
         self.log_browse.clicked.connect(self._browse_logs)
         self.tabs.addTab(w, "Histórico")
 
@@ -600,6 +649,7 @@ class SettingsDialog(QDialog):
                 "folder": self.log_folder.text().strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
                 "mode": self.log_mode.currentText(),
                 "separator": self.log_sep.currentText(),
+                "interval_sec": float(self.log_interval.value()),
             }
         }
         for i in range(self.vars_layout.count()):
@@ -611,6 +661,91 @@ class SettingsDialog(QDialog):
 
     def result_config(self):
         return self._cfg
+
+
+class BasicPlot(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._series = []
+        self._x_min = 0.0
+        self._x_max = 1.0
+        self._y_min = 0.0
+        self._y_max = 1.0
+        self._colors = [QColor('#1f77b4'), QColor('#ff7f0e'), QColor('#2ca02c'), QColor('#d62728'), QColor('#9467bd'), QColor('#8c564b')]
+
+    def set_data(self, series):
+        self._series = series or []
+        xs = []
+        ys = []
+        for s in self._series:
+            for x, y in s.get('points', []):
+                xs.append(float(x))
+                ys.append(float(y))
+        if xs and ys:
+            self._x_min = min(xs); self._x_max = max(xs)
+            self._y_min = min(ys); self._y_max = max(ys)
+            if self._x_min == self._x_max:
+                self._x_max = self._x_min + 1.0
+            if self._y_min == self._y_max:
+                self._y_max = self._y_min + 1.0
+        self.update()
+
+    def paintEvent(self, e):
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            rect = self.rect()
+            left = 60; right = 20; top = 20; bottom = 40
+            plot_w = max(10, rect.width() - left - right)
+            plot_h = max(10, rect.height() - top - bottom)
+            p.fillRect(rect, QColor('#ffffff'))
+            axis_pen = QPen(QColor('#94a3b8'))
+            p.setPen(axis_pen)
+            p.drawRect(left, top, plot_w, plot_h)
+            p.setFont(QFont('', 9))
+            # Horizontal grid and Y labels
+            denom_y = max(1e-9, (self._y_max - self._y_min))
+            for i in range(6):
+                yv = self._y_min + (self._y_max - self._y_min) * i / 5.0
+                ypx = top + plot_h - int((yv - self._y_min) / denom_y * plot_h)
+                p.drawLine(left - 4, ypx, left + plot_w, ypx)
+                p.drawText(4, ypx + 4, f"{yv:.2f}")
+            # Vertical grid and X labels
+            denom_x = max(1e-9, (self._x_max - self._x_min))
+            for i in range(6):
+                xv = self._x_min + (self._x_max - self._x_min) * i / 5.0
+                xpx = left + int((xv - self._x_min) / denom_x * plot_w)
+                p.drawLine(xpx, top, xpx, top + plot_h + 4)
+                if hasattr(QDateTime, 'fromSecsSinceEpoch'):
+                    dt = QDateTime.fromSecsSinceEpoch(int(xv))
+                else:
+                    dt = QDateTime.fromMSecsSinceEpoch(int(xv * 1000))
+                p.drawText(xpx - 30, top + plot_h + 18, dt.toString('HH:mm'))
+            # Series lines
+            for idx, s in enumerate(self._series):
+                pts = s.get('points', [])
+                if not pts:
+                    continue
+                color = self._colors[idx % len(self._colors)]
+                pen = QPen(color); pen.setWidth(2)
+                p.setPen(pen)
+                path = QPainterPath()
+                first = True
+                for x, y in pts:
+                    xpx = left + (float(x) - self._x_min) / denom_x * plot_w
+                    ypx = top + plot_h - (float(y) - self._y_min) / denom_y * plot_h
+                    if first:
+                        path.moveTo(xpx, ypx); first = False
+                    else:
+                        path.lineTo(xpx, ypx)
+                p.drawPath(path)
+            p.end()
+        except Exception:
+            # Fail silently to avoid crashing the UI on paint
+            try:
+                p.end()
+            except Exception:
+                pass
 
 
 class GraphsDialog(QDialog):
@@ -651,8 +786,12 @@ class GraphsDialog(QDialog):
         controls.addLayout(btn_row)
         top.addLayout(controls, 0)
         layout.addLayout(top)
+        self._chart = None
+        self._chart_view = None
         self._pg = None
-        self.plot = None
+        self._pg_plot = None
+        self._img_label = None
+        self._basic_plot = None
         self.plot_area = QWidget()
         self._plot_area_layout = QVBoxLayout(self.plot_area)
         layout.addWidget(self.plot_area, 1)
@@ -728,33 +867,23 @@ class GraphsDialog(QDialog):
         if since > until:
             QMessageBox.warning(self, "Gráficos", "El rango de tiempo es inválido")
             return
-        if self._pg is None or self.plot is None:
-            try:
-                import pyqtgraph as pg  # type: ignore
-                self._pg = pg
-                try:
-                    axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation='bottom')
-                    self.plot = pg.PlotWidget(axisItems={'bottom': axis})
-                except Exception:
-                    self.plot = pg.PlotWidget()
-                self.plot.addLegend()
-                self.plot.showGrid(x=True, y=True, alpha=0.3)
-                self.plot.setLabel('bottom', 'Tiempo')
-                self.plot.setLabel('left', 'Valor')
-                self._plot_area_layout.addWidget(self.plot)
-            except Exception:
-                QMessageBox.warning(self, "Gráficos", "pyqtgraph no está disponible")
-                return
-        self.plot.clear()
+        for i in reversed(range(self._plot_area_layout.count())):
+            w = self._plot_area_layout.itemAt(i).widget()
+            if w:
+                w.setParent(None)
+        series = []
         for var in selected:
             rows = self._read_rows_for_var(var, since, until)
             if not rows:
                 continue
-            xs = [r[0].timestamp() for r in rows]
-            ys = [r[1] for r in rows]
-            pen = self._pg.mkPen(width=2)
-            self.plot.plot(xs, ys, pen=pen, name=var.get("name"))
-        self.plot.enableAutoRange(axis='xy', enable=True)
+            points = [(r[0].timestamp(), r[1]) for r in rows]
+            series.append({"name": var.get("name"), "points": points})
+        if not series:
+            QMessageBox.information(self, "Gráficos", "No hay datos en el rango seleccionado")
+            return
+        self._basic_plot = BasicPlot()
+        self._basic_plot.set_data(series)
+        self._plot_area_layout.addWidget(self._basic_plot)
 
 
 class MainWindow(QMainWindow):
@@ -815,8 +944,8 @@ class MainWindow(QMainWindow):
         self.header.setObjectName("Header")
         self.header.setStyleSheet("""
             #Header { background:#0ea5e9; border:0; border-radius:0; }
-            #Header QLabel#Title { color:#ffffff; font-size:22px; font-weight:700; }
-            #Header QPushButton { color:#0f172a; background:#ffffff; border:1px solid #e2e8f0; border-radius:10px; padding:8px 14px; }
+            #Header QLabel#Title { color:#ffffff; font-size:24px; font-weight:800; letter-spacing:0.3px; }
+            #Header QPushButton { color:#0f172a; background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:10px 16px; font-weight:600; }
             #Header QPushButton:hover { background:#f8fafc; }
         """)
         header_layout = QHBoxLayout(self.header)

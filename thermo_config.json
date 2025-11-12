@@ -7,7 +7,7 @@
     "bytesize": 8,
     "timeout": 1.0
   },
-  "poll_interval_ms": 1000,
+  "poll_interval_ms": 200,
   "variables": [
     {
       "id": "fbece77b-52be-46ce-b6b1-c53001742480",
@@ -164,6 +164,7 @@
     "enabled": true,
     "folder": "C:\\Users\\JCUENTAS\\Desktop\\THERMO_CALI\\logs",
     "mode": "per_variable",
-    "separator": ","
+    "separator": ",",
+    "interval_sec": 60.0
   }
 }
