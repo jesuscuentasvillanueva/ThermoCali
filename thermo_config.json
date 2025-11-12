@@ -20,8 +20,9 @@
       "scale": 0.1,
       "decimal_shift": 1,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
-      "poll_interval_ms": 1000,
+      "poll_interval_ms": 50,
       "enabled": true
     },
     {
@@ -35,8 +36,9 @@
       "scale": 0.1,
       "decimal_shift": 1,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
-      "poll_interval_ms": 1000,
+      "poll_interval_ms": 50,
       "enabled": true
     },
     {
@@ -50,6 +52,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -65,6 +68,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -80,6 +84,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -95,6 +100,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -110,6 +116,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -125,6 +132,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -140,6 +148,7 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": -0.1,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
       "enabled": true
@@ -155,8 +164,25 @@
       "scale": 0.1,
       "decimal_shift": 0,
       "offset": 0.0,
+      "calibration": 0.0,
       "decimals": 1,
       "poll_interval_ms": 1000,
+      "enabled": true
+    },
+    {
+      "id": "fb69c682-6efe-483c-9af3-80eceaa840b9",
+      "name": "Temperatura 11",
+      "unit": "\u00b0C",
+      "slave": 1,
+      "type": "holding",
+      "address": 0,
+      "data_type": "uint16",
+      "scale": 1.0,
+      "decimal_shift": 0,
+      "offset": 0.0,
+      "calibration": 0.0,
+      "decimals": 1,
+      "poll_interval_ms": 200,
       "enabled": true
     }
   ],

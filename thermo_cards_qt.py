@@ -7,7 +7,7 @@ import csv
 from datetime import datetime, timedelta
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QFrame, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QGridLayout, QGroupBox, QDialog, QTabWidget, QToolBar, QAction, QStyle, QSizePolicy, QStyleFactory, QGraphicsDropShadowEffect, QDateTimeEdit, QListWidget, QListWidgetItem
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QDateTime
-from PyQt5.QtGui import QPalette, QColor, QPainter, QPen, QFont, QPainterPath
+from PyQt5.QtGui import QPalette, QColor, QPainter, QPen, QFont, QPainterPath, QPixmap, QLinearGradient, QBrush
 from pymodbus.client import ModbusSerialClient
 from serial.tools import list_ports
 
@@ -178,7 +178,8 @@ class VariableCard(QFrame):
         self.chip_addr = QLabel("")
         self.chip_shift = QLabel("")
         self.chip_scale = QLabel("")
-        for ch in [self.chip_slave, self.chip_type, self.chip_addr, self.chip_shift, self.chip_scale]:
+        self.chip_cal = QLabel("")
+        for ch in [self.chip_slave, self.chip_type, self.chip_addr, self.chip_shift, self.chip_scale, self.chip_cal]:
             ch.setStyleSheet("color:#334155;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:3px 10px;font-size:13px;")
             chips.addWidget(ch)
         chips.addStretch(1)
@@ -202,6 +203,10 @@ class VariableCard(QFrame):
         self.chip_scale.setVisible(sc != 1.0)
         if sc != 1.0:
             self.chip_scale.setText(f"×{sc}")
+        cal = float(self.var.get('calibration', 0.0))
+        self.chip_cal.setVisible(abs(cal) > 1e-9)
+        if abs(cal) > 1e-9:
+            self.chip_cal.setText(f"cal {cal:+g}")
 
     def set_value(self, value, raw):
         dec = int(self.var.get("decimals", 1))
@@ -347,9 +352,10 @@ class PollingWorker(QThread):
             r = r - 65536
         scale = float(var.get("scale", 1.0))
         offset = float(var.get("offset", 0.0))
+        calibration = float(var.get("calibration", 0.0))
         shift = int(var.get("decimal_shift", 0))
         factor = (10.0 ** (-shift)) if shift != 0 else 1.0
-        return r * factor * scale + offset
+        return r * factor * scale + offset + calibration
 
 
 class CSVLogger:
@@ -458,6 +464,7 @@ class VariableForm(QFrame):
         self.scale_spin = QDoubleSpinBox(); self.scale_spin.setDecimals(6); self.scale_spin.setRange(-1e6,1e6); self.scale_spin.setSingleStep(0.1); self.scale_spin.setValue(float(self.var.get("scale",1.0)))
         self.dec_shift_spin = QSpinBox(); self.dec_shift_spin.setRange(-9,9); self.dec_shift_spin.setSingleStep(1); self.dec_shift_spin.setValue(int(self.var.get("decimal_shift",0)))
         self.offset_spin = QDoubleSpinBox(); self.offset_spin.setDecimals(6); self.offset_spin.setRange(-1e6,1e6); self.offset_spin.setSingleStep(0.1); self.offset_spin.setValue(float(self.var.get("offset",0.0)))
+        self.calib_spin = QDoubleSpinBox(); self.calib_spin.setDecimals(6); self.calib_spin.setRange(-1e6,1e6); self.calib_spin.setSingleStep(0.1); self.calib_spin.setValue(float(self.var.get("calibration",0.0)))
         self.decimals_spin = QSpinBox(); self.decimals_spin.setRange(0,6); self.decimals_spin.setValue(int(self.var.get("decimals",1)))
         self.interval_spin = QSpinBox(); self.interval_spin.setRange(50,60000); self.interval_spin.setSingleStep(50); self.interval_spin.setValue(int(self.var.get("poll_interval_ms",1000)))
         self.enabled_check = QCheckBox("Activo"); self.enabled_check.setChecked(bool(self.var.get("enabled",True)))
@@ -469,6 +476,7 @@ class VariableForm(QFrame):
             ("Desplazar coma", self.dec_shift_spin),
             ("Escala", self.scale_spin),
             ("Offset", self.offset_spin),
+            ("Calibración", self.calib_spin),
             ("Decimales", self.decimals_spin),
             ("Intervalo ms", self.interval_spin),
         ]
@@ -491,6 +499,7 @@ class VariableForm(QFrame):
             "scale": float(self.scale_spin.value()),
             "decimal_shift": int(self.dec_shift_spin.value()),
             "offset": float(self.offset_spin.value()),
+            "calibration": float(self.calib_spin.value()),
             "decimals": int(self.decimals_spin.value()),
             "poll_interval_ms": int(self.interval_spin.value()),
             "enabled": bool(self.enabled_check.isChecked()),
@@ -502,6 +511,16 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configuración")
         self.resize(900, 650)
+        self.setStyleSheet(
+            "QDialog{background:#ffffff;}"
+            "QTabWidget::pane{border:1px solid #e5e7eb; border-radius:10px; margin-top:6px;}"
+            "QTabBar::tab{padding:8px 14px; border:1px solid #e5e7eb; border-bottom:0; background:#f8fafc; margin-right:4px; border-top-left-radius:8px; border-top-right-radius:8px;}"
+            "QTabBar::tab:selected{background:#ffffff; color:#0f172a; font-weight:600;}"
+            "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox{padding:6px 8px; border:1px solid #e2e8f0; border-radius:8px;}"
+            "QGroupBox{border:1px solid #e5e7eb; border-radius:8px; margin-top:10px; padding:6px 8px; font-weight:600;}"
+            "QPushButton{padding:8px 12px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc;}"
+            "QPushButton:hover{background:#f1f5f9;}"
+        )
         self._selected_id = selected_id
         self._cfg = json.loads(json.dumps(cfg))
         v = QVBoxLayout(self)
@@ -596,7 +615,7 @@ class SettingsDialog(QDialog):
                 break
 
     def _add_var_form(self, var=None):
-        if var is None:
+        if not isinstance(var, dict):
             var = {
                 "id": str(uuid.uuid4()),
                 "name": f"Temperatura {self.vars_layout.count()+1}",
@@ -779,10 +798,22 @@ class GraphsDialog(QDialog):
         range_row.addWidget(QLabel("Hasta"))
         range_row.addWidget(self.until_edit)
         controls.addLayout(range_row)
+        quick_row = QHBoxLayout()
+        self.btn_1h = QPushButton("1h")
+        self.btn_6h = QPushButton("6h")
+        self.btn_24h = QPushButton("24h")
+        self.btn_hoy = QPushButton("Hoy")
+        self.btn_semana = QPushButton("Semana")
+        self.btn_todo = QPushButton("30d")
+        for b in [self.btn_1h, self.btn_6h, self.btn_24h, self.btn_hoy, self.btn_semana, self.btn_todo]:
+            quick_row.addWidget(b)
+        controls.addLayout(quick_row)
         btn_row = QHBoxLayout()
         self.plot_btn = QPushButton("Graficar")
+        self.export_btn = QPushButton("Exportar PNG")
         btn_row.addStretch(1)
         btn_row.addWidget(self.plot_btn)
+        btn_row.addWidget(self.export_btn)
         controls.addLayout(btn_row)
         top.addLayout(controls, 0)
         layout.addLayout(top)
@@ -795,7 +826,18 @@ class GraphsDialog(QDialog):
         self.plot_area = QWidget()
         self._plot_area_layout = QVBoxLayout(self.plot_area)
         layout.addWidget(self.plot_area, 1)
+        self.legend_bar = QHBoxLayout()
+        layout.addLayout(self.legend_bar)
         self.plot_btn.clicked.connect(self.on_plot)
+        self.export_btn.clicked.connect(self.on_export_png)
+        self.btn_1h.clicked.connect(lambda: self._quick_range(hours=1))
+        self.btn_6h.clicked.connect(lambda: self._quick_range(hours=6))
+        self.btn_24h.clicked.connect(lambda: self._quick_range(hours=24))
+        self.btn_hoy.clicked.connect(lambda: self._quick_today())
+        self.btn_semana.clicked.connect(lambda: self._quick_range(days=7))
+        self.btn_todo.clicked.connect(lambda: self._quick_range(days=30))
+
+        self.setStyleSheet("QDialog{background:#ffffff;} QPushButton{padding:8px 12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;} QPushButton:hover{background:#f1f5f9;}")
 
     def _safe(self, s):
         s = str(s)
@@ -884,6 +926,49 @@ class GraphsDialog(QDialog):
         self._basic_plot = BasicPlot()
         self._basic_plot.set_data(series)
         self._plot_area_layout.addWidget(self._basic_plot)
+        for i in reversed(range(self.legend_bar.count())):
+            it = self.legend_bar.itemAt(i)
+            w = it.widget() if it else None
+            if w:
+                w.setParent(None)
+        colors = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b']
+        for idx, s in enumerate(series):
+            swatch = QLabel()
+            pm = QPixmap(10,10); pm.fill(QColor(colors[idx % len(colors)])); swatch.setPixmap(pm)
+            name = QLabel(s.get('name',''))
+            name.setStyleSheet("color:#334155;")
+            box = QHBoxLayout(); cont = QWidget(); cont.setLayout(box)
+            box.addWidget(swatch); box.addWidget(name)
+            box.setContentsMargins(0,0,12,0)
+            self.legend_bar.addWidget(cont)
+
+
+    def _quick_range(self, hours=0, days=0):
+        end = QDateTime.currentDateTime()
+        start = end.addSecs(-(hours*3600 + days*24*3600))
+        self.since_edit.setDateTime(start)
+        self.until_edit.setDateTime(end)
+        self.on_plot()
+
+    def _quick_today(self):
+        end = QDateTime.currentDateTime()
+        start = QDateTime(end.date(), QDateTime().time())
+        self.since_edit.setDateTime(start)
+        self.until_edit.setDateTime(end)
+        self.on_plot()
+
+    def on_export_png(self):
+        if not self._basic_plot:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Guardar PNG", os.path.join(self.log_folder, "grafico.png"), "PNG (*.png)")
+        if not path:
+            return
+        pm = self._basic_plot.grab()
+        try:
+            pm.save(path, "PNG")
+            QMessageBox.information(self, "Gráficos", "Imagen exportada")
+        except Exception as e:
+            QMessageBox.warning(self, "Gráficos", str(e))
 
 
 class MainWindow(QMainWindow):
@@ -896,6 +981,8 @@ class MainWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
         self.top_box = QGroupBox("Comunicación")
         top_layout = QGridLayout(self.top_box)
         self.port_combo = QComboBox()
@@ -950,6 +1037,28 @@ class MainWindow(QMainWindow):
         """)
         header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(16, 10, 16, 10)
+        logo_size = 28
+        pm = QPixmap(logo_size, logo_size)
+        pm.fill(Qt.transparent)
+        try:
+            qp = QPainter(pm)
+            qp.setRenderHint(QPainter.Antialiasing)
+            grad = QLinearGradient(0, 0, 0, logo_size)
+            grad.setColorAt(0.0, QColor(14, 165, 233))
+            grad.setColorAt(1.0, QColor(56, 189, 248))
+            qp.setBrush(QBrush(grad))
+            qp.setPen(Qt.NoPen)
+            qp.drawEllipse(0, 0, logo_size, logo_size)
+            qp.setPen(QColor(255,255,255))
+            f = QFont(); f.setBold(True); f.setPointSize(14)
+            qp.setFont(f)
+            qp.drawText(pm.rect(), Qt.AlignCenter, "T")
+            qp.end()
+        except Exception:
+            pass
+        self.logo_label = QLabel()
+        self.logo_label.setPixmap(pm)
+        header_layout.addWidget(self.logo_label)
         self.title_label = QLabel("TermoCali")
         self.title_label.setObjectName("Title")
         header_layout.addWidget(self.title_label)
@@ -1034,13 +1143,21 @@ class MainWindow(QMainWindow):
             save_config(self.cfg)
             vars_list = self.cfg.get("variables", [])
         cols = 3
+        dirty = False
         for idx, var in enumerate(vars_list):
+            vid = var.get("id")
+            if not vid:
+                vid = str(uuid.uuid4())
+                var["id"] = vid
+                dirty = True
             card = VariableCard(var)
             r = idx // cols
             c = idx % cols
             self.cards_layout.addWidget(card, r, c)
-            self.cards[var["id"]] = card
-            card.config_btn.clicked.connect(lambda _, vid=var["id"]: self.on_open_settings(vid))
+            self.cards[vid] = card
+            card.config_btn.clicked.connect(lambda _, vid=vid: self.on_open_settings(vid))
+        if dirty:
+            save_config(self.cfg)
 
     def on_connect(self):
         save_config(self.cfg)
