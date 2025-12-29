@@ -1,12 +1,14 @@
+# -*- coding: utf-8 -*-
 import sys
 import os
 import json
 import time
 import uuid
 import csv
+import glob
 from datetime import datetime, timedelta
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QFrame, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QGridLayout, QGroupBox, QDialog, QTabWidget, QToolBar, QAction, QStyle, QSizePolicy, QStyleFactory, QGraphicsDropShadowEffect, QDateTimeEdit, QListWidget, QListWidgetItem
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QDateTime
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QFrame, QScrollArea, QFileDialog, QMessageBox, QCheckBox, QGridLayout, QGroupBox, QDialog, QTabWidget, QToolBar, QAction, QStyle, QSizePolicy, QStyleFactory, QGraphicsDropShadowEffect, QDateTimeEdit, QListWidget, QListWidgetItem, QToolButton, QAbstractItemView
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QDateTime, QTimer
 from PyQt5.QtGui import QPalette, QColor, QPainter, QPen, QFont, QPainterPath, QPixmap, QLinearGradient, QBrush
 from pymodbus.client import ModbusSerialClient
 from serial.tools import list_ports
@@ -25,6 +27,20 @@ def default_config():
             "timeout": 1.0
         },
         "poll_interval_ms": 1000,
+        "zones": [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "General",
+                "collapsed": False,
+                "monitor": True,
+                "alarm_enabled": False,
+                "alarm_min": None,
+                "alarm_max": None,
+            }
+        ],
+        "ui": {
+            "density": "normal"
+        },
         "variables": [],
         "logging": {
             "enabled": False,
@@ -54,6 +70,71 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
+
+
+def ensure_zones(cfg):
+    changed = False
+    if not isinstance(cfg, dict):
+        return False
+    zones = cfg.get("zones")
+    if not isinstance(zones, list) or not zones:
+        zones = [{
+            "id": str(uuid.uuid4()),
+            "name": "General",
+            "collapsed": False,
+            "monitor": True,
+            "alarm_enabled": False,
+            "alarm_min": None,
+            "alarm_max": None,
+        }]
+        cfg["zones"] = zones
+        changed = True
+    for zone in zones:
+        if not zone.get("id"):
+            zone["id"] = str(uuid.uuid4())
+            changed = True
+        if not zone.get("name"):
+            zone["name"] = "Zona"
+            changed = True
+        if "collapsed" not in zone:
+            zone["collapsed"] = False
+            changed = True
+        if "monitor" not in zone:
+            zone["monitor"] = False
+            changed = True
+        if "alarm_enabled" not in zone:
+            zone["alarm_enabled"] = False
+            changed = True
+        if "alarm_min" not in zone:
+            zone["alarm_min"] = None
+            changed = True
+        if "alarm_max" not in zone:
+            zone["alarm_max"] = None
+            changed = True
+    ui_cfg = cfg.get("ui")
+    if not isinstance(ui_cfg, dict):
+        cfg["ui"] = {"density": "normal"}
+        changed = True
+    else:
+        if "density" not in ui_cfg:
+            ui_cfg["density"] = "normal"
+            changed = True
+    zone_ids = {z.get("id") for z in zones}
+    default_zone_id = zones[0].get("id")
+    for var in cfg.get("variables", []):
+        if var.get("zone_id") not in zone_ids:
+            var["zone_id"] = default_zone_id
+            changed = True
+        if "alarm_enabled" not in var:
+            var["alarm_enabled"] = False
+            changed = True
+        if "alarm_min" not in var:
+            var["alarm_min"] = None
+            changed = True
+        if "alarm_max" not in var:
+            var["alarm_max"] = None
+            changed = True
+    return changed
 
 
 class VariableDialog(QWidget):
@@ -137,6 +218,10 @@ class VariableDialog(QWidget):
             "decimals": int(self.decimals_spin.value()),
             "poll_interval_ms": int(self.interval_spin.value()),
             "enabled": bool(self.enabled_check.isChecked()),
+            "zone_id": self.data.get("zone_id"),
+            "alarm_enabled": bool(self.data.get("alarm_enabled", False)),
+            "alarm_min": self.data.get("alarm_min"),
+            "alarm_max": self.data.get("alarm_max"),
         }
         self.close()
 
@@ -147,22 +232,38 @@ class VariableCard(QFrame):
         self.var = var
         self.setFrameShape(QFrame.Panel)
         self.setFrameShadow(QFrame.Raised)
-        self.setStyleSheet("QFrame{border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;} QPushButton{padding:10px 14px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;font-weight:600;} QPushButton:hover{background:#f1f5f9;}")
+        self.setStyleSheet(
+            "QFrame{border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;}"
+            "QPushButton{padding:10px 14px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;font-weight:600;}"
+            "QPushButton:hover{background:#f1f5f9;}"
+        )
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(18)
         shadow.setOffset(0, 4)
         shadow.setColor(QColor(0, 0, 0, 40))
         self.setGraphicsEffect(shadow)
-        v = QVBoxLayout(self)
+        self._density = "normal"
+        self._monitor = False
+        self._main_layout = QVBoxLayout(self)
+        self._main_layout.setSpacing(8)
         h = QHBoxLayout()
         self.title = QLabel(self.var.get("name", "Temperatura"))
         self.title.setStyleSheet("font-weight:700;font-size:20px;color:#0f172a;")
-        self.status = QLabel("●")
-        self.status.setStyleSheet("color:gray;font-size:14px;")
+        status_wrap = QWidget()
+        status_layout = QHBoxLayout(status_wrap)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(6)
+        self.status_dot = QLabel()
+        self.status_dot.setFixedSize(10, 10)
+        self.status_dot.setStyleSheet("background:#94a3b8;border-radius:5px;")
+        self.status_text = QLabel("Sin datos")
+        self.status_text.setStyleSheet("color:#64748b;font-size:12px;")
+        status_layout.addWidget(self.status_dot)
+        status_layout.addWidget(self.status_text)
         h.addWidget(self.title)
         h.addStretch(1)
-        h.addWidget(self.status)
-        v.addLayout(h)
+        h.addWidget(status_wrap)
+        self._main_layout.addLayout(h)
         c = QHBoxLayout()
         self.value_label = QLabel("--")
         self.value_label.setStyleSheet("font-size:40px;font-weight:700;color:#0f172a;")
@@ -171,25 +272,31 @@ class VariableCard(QFrame):
         c.addWidget(self.value_label)
         c.addWidget(self.unit_label)
         c.addStretch(1)
-        v.addLayout(c)
+        self._main_layout.addLayout(c)
         chips = QHBoxLayout()
         self.chip_slave = QLabel("")
         self.chip_type = QLabel("")
         self.chip_addr = QLabel("")
         self.chip_shift = QLabel("")
         self.chip_scale = QLabel("")
+        self.chip_offset = QLabel("")
         self.chip_cal = QLabel("")
-        for ch in [self.chip_slave, self.chip_type, self.chip_addr, self.chip_shift, self.chip_scale, self.chip_cal]:
-            ch.setStyleSheet("color:#334155;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:3px 10px;font-size:13px;")
+        self._chip_base = "color:#334155;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:3px 10px;font-size:13px;"
+        for ch in [self.chip_slave, self.chip_type, self.chip_addr, self.chip_shift, self.chip_scale, self.chip_offset, self.chip_cal]:
+            ch.setStyleSheet(self._chip_base)
             chips.addWidget(ch)
         chips.addStretch(1)
-        v.addLayout(chips)
+        self._main_layout.addLayout(chips)
+        self.last_update_label = QLabel("Sin lecturas")
+        self.last_update_label.setStyleSheet("color:#94a3b8;font-size:12px;")
+        self._main_layout.addWidget(self.last_update_label)
         self._update_chips()
         b = QHBoxLayout()
         self.config_btn = QPushButton("Configurar")
         b.addStretch(1)
         b.addWidget(self.config_btn)
-        v.addLayout(b)
+        self._main_layout.addLayout(b)
+        self.set_density("normal", monitor=False)
 
     def _update_chips(self):
         self.chip_slave.setText(f"S{self.var.get('slave', 1)}")
@@ -198,15 +305,25 @@ class VariableCard(QFrame):
         shift = int(self.var.get('decimal_shift', 0))
         self.chip_shift.setVisible(shift != 0)
         if shift != 0:
-            self.chip_shift.setText(f"÷10^{shift}" if shift > 0 else f"×10^{abs(shift)}")
+            self.chip_shift.setText(f"/10^{shift}" if shift > 0 else f"x10^{abs(shift)}")
         sc = float(self.var.get('scale', 1.0))
         self.chip_scale.setVisible(sc != 1.0)
         if sc != 1.0:
-            self.chip_scale.setText(f"×{sc}")
+            self.chip_scale.setText(f"x{sc}")
+        off = float(self.var.get('offset', 0.0))
+        self.chip_offset.setVisible(abs(off) > 1e-9)
+        if abs(off) > 1e-9:
+            self.chip_offset.setText(f"off {off:+g}")
+            self.chip_offset.setStyleSheet(self._chip_base + "background:#fee2e2;border-color:#fecaca;color:#991b1b;")
+        else:
+            self.chip_offset.setStyleSheet(self._chip_base)
         cal = float(self.var.get('calibration', 0.0))
         self.chip_cal.setVisible(abs(cal) > 1e-9)
         if abs(cal) > 1e-9:
             self.chip_cal.setText(f"cal {cal:+g}")
+            self.chip_cal.setStyleSheet(self._chip_base + "background:#fef3c7;border-color:#fde68a;color:#92400e;")
+        else:
+            self.chip_cal.setStyleSheet(self._chip_base)
 
     def set_value(self, value, raw):
         dec = int(self.var.get("decimals", 1))
@@ -215,10 +332,14 @@ class VariableCard(QFrame):
         except Exception:
             text = str(value)
         self.value_label.setText(text)
-        self.status.setStyleSheet("color:#2ecc71;")
+        self.status_dot.setStyleSheet("background:#22c55e;border-radius:5px;")
+        self.status_text.setStyleSheet("color:#16a34a;font-size:12px;")
+        self.status_text.setText("OK")
 
     def set_error(self):
-        self.status.setStyleSheet("color:#e74c3c;")
+        self.status_dot.setStyleSheet("background:#ef4444;border-radius:5px;")
+        self.status_text.setStyleSheet("color:#dc2626;font-size:12px;")
+        self.status_text.setText("Error")
 
     def update_meta(self, var):
         self.var = var
@@ -226,11 +347,179 @@ class VariableCard(QFrame):
         self.unit_label.setText(self.var.get("unit", "°C"))
         self._update_chips()
 
+    def set_last_update(self, text):
+        self.last_update_label.setText(text)
+
+    def set_state(self, stale=False, in_alarm=False, acked=False):
+        if stale:
+            self.status_dot.setStyleSheet("background:#94a3b8;border-radius:5px;")
+            self.status_text.setStyleSheet("color:#64748b;font-size:12px;")
+            self.status_text.setText("SIN DATOS")
+            self.setStyleSheet(
+                "QFrame{border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc;}"
+                "QPushButton{padding:10px 14px;border:1px solid #e2e8f0;border-radius:10px;background:#f1f5f9;font-weight:600;}"
+                "QPushButton:hover{background:#e2e8f0;}"
+            )
+        elif in_alarm and not acked:
+            self.status_dot.setStyleSheet("background:#ef4444;border-radius:5px;")
+            self.status_text.setStyleSheet("color:#dc2626;font-size:12px;")
+            self.status_text.setText("ALARMA")
+            self.setStyleSheet(
+                "QFrame{border:1px solid #fca5a5;border-radius:12px;background:#fef2f2;}"
+                "QPushButton{padding:10px 14px;border:1px solid #fecaca;border-radius:10px;background:#fff5f5;font-weight:600;}"
+                "QPushButton:hover{background:#fee2e2;}"
+            )
+        elif in_alarm and acked:
+            self.status_dot.setStyleSheet("background:#f59e0b;border-radius:5px;")
+            self.status_text.setStyleSheet("color:#b45309;font-size:12px;")
+            self.status_text.setText("ALARMA ACK")
+            self.setStyleSheet(
+                "QFrame{border:1px solid #fcd34d;border-radius:12px;background:#fffbeb;}"
+                "QPushButton{padding:10px 14px;border:1px solid #fde68a;border-radius:10px;background:#fff7db;font-weight:600;}"
+                "QPushButton:hover{background:#fde68a;}"
+            )
+        else:
+            self.status_dot.setStyleSheet("background:#22c55e;border-radius:5px;")
+            self.status_text.setStyleSheet("color:#16a34a;font-size:12px;")
+            self.status_text.setText("OK")
+            self.setStyleSheet(
+                "QFrame{border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;}"
+                "QPushButton{padding:10px 14px;border:1px solid #e5e7eb;border-radius:10px;background:#f8fafc;font-weight:600;}"
+                "QPushButton:hover{background:#f1f5f9;}"
+            )
+
+    def set_density(self, mode="normal", monitor=False):
+        self._density = mode
+        self._monitor = monitor
+        if monitor:
+            title_size = 26
+            value_size = 56
+            unit_size = 18
+            status_size = 14
+            last_size = 14
+            spacing = 10
+        elif mode == "compact":
+            title_size = 16
+            value_size = 32
+            unit_size = 14
+            status_size = 11
+            last_size = 11
+            spacing = 6
+        else:
+            title_size = 20
+            value_size = 40
+            unit_size = 16
+            status_size = 12
+            last_size = 12
+            spacing = 8
+        self._main_layout.setSpacing(spacing)
+        self.title.setStyleSheet(f"font-weight:700;font-size:{title_size}px;color:#0f172a;")
+        self.value_label.setStyleSheet(f"font-size:{value_size}px;font-weight:700;color:#0f172a;")
+        self.unit_label.setStyleSheet(f"font-size:{unit_size}px;color:#334155;background:#e2efff;border-radius:12px;padding:4px 10px;")
+        self.status_text.setStyleSheet(f"color:#64748b;font-size:{status_size}px;")
+        self.last_update_label.setStyleSheet(f"color:#94a3b8;font-size:{last_size}px;")
+
+class CollapsibleSection(QFrame):
+    toggled = pyqtSignal(str, bool)
+
+    def __init__(self, zone_id, title, collapsed=False):
+        super().__init__()
+        self.zone_id = zone_id
+        self.setObjectName("ZoneSection")
+        self.setStyleSheet("QFrame#ZoneSection{border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;}")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 8)
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+        self.toggle_btn = QToolButton()
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(not collapsed)
+        self.toggle_btn.setArrowType(Qt.DownArrow if not collapsed else Qt.RightArrow)
+        self.toggle_btn.setText(title)
+        self.toggle_btn.setStyleSheet(
+            "QToolButton{border:0;font-weight:700;font-size:16px;color:#0f172a;}"
+            "QToolButton:hover{color:#0369a1;}"
+        )
+        self.toggle_btn.toggled.connect(self._on_toggled)
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("color:#64748b;font-size:12px;")
+        self.alarm_label = QLabel("")
+        self.alarm_label.setStyleSheet("color:#991b1b;background:#fee2e2;border-radius:10px;padding:2px 8px;font-size:12px;")
+        self.alarm_label.setVisible(False)
+        header_layout.addWidget(self.toggle_btn)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.summary_label)
+        header_layout.addWidget(self.alarm_label)
+        layout.addWidget(header)
+        self.content = QWidget()
+        self.content_layout = QGridLayout(self.content)
+        self.content_layout.setSpacing(12)
+        self.content_layout.setContentsMargins(6, 6, 6, 6)
+        self.content.setVisible(not collapsed)
+        layout.addWidget(self.content)
+
+    def _on_toggled(self, checked):
+        self.content.setVisible(checked)
+        self.toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.toggled.emit(self.zone_id, not checked)
+
+    def set_title(self, title):
+        self.toggle_btn.setText(title)
+
+    def set_summary(self, text, alarm_count=0, zone_alarm=False):
+        self.summary_label.setText(text)
+        if alarm_count > 0 or zone_alarm:
+            label = f"Alarmas {alarm_count}" if alarm_count > 0 else "Alarma zona"
+            self.alarm_label.setText(label)
+            self.alarm_label.setVisible(True)
+        else:
+            self.alarm_label.setVisible(False)
+
+
+class AlarmRow(QWidget):
+    ack_clicked = pyqtSignal(str)
+
+    def __init__(self, alarm_id, title, detail, acked=False):
+        super().__init__()
+        self.alarm_id = alarm_id
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(10)
+        text_box = QVBoxLayout()
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet("font-weight:600;color:#0f172a;")
+        self.detail_label = QLabel(detail)
+        self.detail_label.setStyleSheet("color:#64748b;font-size:12px;")
+        text_box.addWidget(self.title_label)
+        text_box.addWidget(self.detail_label)
+        layout.addLayout(text_box, 1)
+        self.ack_btn = QPushButton("ACK")
+        self.ack_btn.clicked.connect(self._on_ack)
+        layout.addWidget(self.ack_btn)
+        self.set_acked(acked)
+
+    def _on_ack(self):
+        self.ack_clicked.emit(self.alarm_id)
+
+    def set_acked(self, acked):
+        if acked:
+            self.ack_btn.setEnabled(False)
+            self.ack_btn.setText("ACK")
+            self.setStyleSheet("background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;")
+        else:
+            self.ack_btn.setEnabled(True)
+            self.ack_btn.setText("ACK")
+            self.setStyleSheet("")
+
 
 class PollingWorker(QThread):
     value_updated = pyqtSignal(str, float, int)
     error = pyqtSignal(str, str)
     status = pyqtSignal(str)
+    connected = pyqtSignal(bool, str)
 
     def __init__(self, serial_cfg, variables, logging_cfg=None):
         super().__init__()
@@ -264,11 +553,13 @@ class PollingWorker(QThread):
         )
         try:
             if not self.client.connect():
-                self.status.emit(f"No se pudo conectar a {self.serial_cfg.get('port')}")
+                message = f"No se pudo conectar a {self.serial_cfg.get('port')}"
+                self.connected.emit(False, message)
                 return
         except Exception as e:
-            self.status.emit(str(e))
+            self.connected.emit(False, str(e))
             return
+        self.connected.emit(True, "")
         self.running = True
         while self.running:
             now = time.monotonic()
@@ -392,6 +683,9 @@ class CSVLogger:
             return os.path.join(self.folder, "termo_log.csv")
         if self.mode == "per_variable":
             name = self._safe(var.get("name", var.get("id","var")))
+            vid = var.get("id")
+            if vid:
+                return os.path.join(self.folder, f"{name}_{vid}_{date_str}.csv")
             return os.path.join(self.folder, f"{name}_{date_str}.csv")
         return os.path.join(self.folder, f"termo_{date_str}.csv")
 
@@ -435,7 +729,7 @@ class CSVLogger:
 class VariableForm(QFrame):
     delete_requested = pyqtSignal(str)
 
-    def __init__(self, var):
+    def __init__(self, var, zones=None):
         super().__init__()
         self.var = dict(var)
         if not self.var.get("id"):
@@ -457,6 +751,18 @@ class VariableForm(QFrame):
         t.addWidget(self.del_btn)
         v.addLayout(t)
         g = QGridLayout()
+        self.zone_combo = QComboBox()
+        self.set_zones(zones or [])
+        self.alarm_enable = QCheckBox("Alarma")
+        self.alarm_enable.setChecked(bool(self.var.get("alarm_enabled", False)))
+        self.alarm_min_spin = QDoubleSpinBox(); self.alarm_min_spin.setDecimals(2); self.alarm_min_spin.setRange(-1e6, 1e6)
+        self.alarm_max_spin = QDoubleSpinBox(); self.alarm_max_spin.setDecimals(2); self.alarm_max_spin.setRange(-1e6, 1e6)
+        if self.var.get("alarm_min") is not None:
+            self.alarm_min_spin.setValue(float(self.var.get("alarm_min")))
+        if self.var.get("alarm_max") is not None:
+            self.alarm_max_spin.setValue(float(self.var.get("alarm_max")))
+        self.alarm_enable.toggled.connect(self._toggle_alarm_fields)
+        self._toggle_alarm_fields(self.alarm_enable.isChecked())
         self.slave_spin = QSpinBox(); self.slave_spin.setRange(0,247); self.slave_spin.setValue(int(self.var.get("slave",1)))
         self.type_combo = QComboBox(); self.type_combo.addItems(["holding","input"]); self.type_combo.setCurrentText(self.var.get("type","holding"))
         self.addr_spin = QSpinBox(); self.addr_spin.setRange(0,65535); self.addr_spin.setValue(int(self.var.get("address",0)))
@@ -469,6 +775,10 @@ class VariableForm(QFrame):
         self.interval_spin = QSpinBox(); self.interval_spin.setRange(50,60000); self.interval_spin.setSingleStep(50); self.interval_spin.setValue(int(self.var.get("poll_interval_ms",1000)))
         self.enabled_check = QCheckBox("Activo"); self.enabled_check.setChecked(bool(self.var.get("enabled",True)))
         fields = [
+            ("Zona", self.zone_combo),
+            ("Alarmas", self.alarm_enable),
+            ("Alarma min", self.alarm_min_spin),
+            ("Alarma max", self.alarm_max_spin),
             ("Esclavo", self.slave_spin),
             ("Tipo", self.type_combo),
             ("Dirección", self.addr_spin),
@@ -483,15 +793,37 @@ class VariableForm(QFrame):
         for i,(lbl,w) in enumerate(fields):
             g.addWidget(QLabel(lbl), i//2, (i%2)*2)
             g.addWidget(w, i//2, (i%2)*2+1)
-        g.addWidget(self.enabled_check, 4, 0, 1, 2)
+        rows = (len(fields) + 1) // 2
+        g.addWidget(self.enabled_check, rows, 0, 1, 2)
         v.addLayout(g)
         self.del_btn.clicked.connect(lambda: self.delete_requested.emit(self.var.get("id")))
+
+    def _toggle_alarm_fields(self, enabled):
+        self.alarm_min_spin.setEnabled(enabled)
+        self.alarm_max_spin.setEnabled(enabled)
+
+    def set_zones(self, zones, default_zone_id=None):
+        current_id = self.zone_combo.currentData()
+        zone_ids = [z.get("id") for z in zones if z.get("id")]
+        self.zone_combo.clear()
+        for zone in zones:
+            self.zone_combo.addItem(zone.get("name", "Zona"), zone.get("id"))
+        desired_id = current_id or self.var.get("zone_id")
+        if desired_id not in zone_ids:
+            desired_id = default_zone_id or (zone_ids[0] if zone_ids else None)
+        if desired_id in zone_ids:
+            self.zone_combo.setCurrentIndex(zone_ids.index(desired_id))
+            self.var["zone_id"] = desired_id
 
     def data(self):
         return {
             "id": self.var.get("id"),
             "name": self.name_edit.text().strip() or "Temperatura",
             "unit": self.unit_edit.text().strip() or "°C",
+            "zone_id": self.zone_combo.currentData() or self.var.get("zone_id"),
+            "alarm_enabled": bool(self.alarm_enable.isChecked()),
+            "alarm_min": float(self.alarm_min_spin.value()) if self.alarm_enable.isChecked() else None,
+            "alarm_max": float(self.alarm_max_spin.value()) if self.alarm_enable.isChecked() else None,
             "slave": int(self.slave_spin.value()),
             "type": self.type_combo.currentText(),
             "address": int(self.addr_spin.value()),
@@ -523,10 +855,23 @@ class SettingsDialog(QDialog):
         )
         self._selected_id = selected_id
         self._cfg = json.loads(json.dumps(cfg))
+        ensure_zones(self._cfg)
+        self._zone_meta = {}
+        for zone in self._cfg.get("zones", []):
+            zid = zone.get("id")
+            self._zone_meta[zid] = {
+                "collapsed": bool(zone.get("collapsed", False)),
+                "monitor": bool(zone.get("monitor", False)),
+                "alarm_enabled": bool(zone.get("alarm_enabled", False)),
+                "alarm_min": zone.get("alarm_min"),
+                "alarm_max": zone.get("alarm_max"),
+            }
+        self._loading_zone_meta = False
         v = QVBoxLayout(self)
         self.tabs = QTabWidget()
         v.addWidget(self.tabs)
         self._build_comm_tab()
+        self._build_zones_tab()
         self._build_vars_tab()
         self._build_log_tab()
         btns = QHBoxLayout()
@@ -568,6 +913,51 @@ class SettingsDialog(QDialog):
         g.addWidget(refresh_btn,0,4)
         self.tabs.addTab(w, "Comunicación")
 
+    def _build_zones_tab(self):
+        w = QWidget(); v = QVBoxLayout(w)
+        self.zones_list = QListWidget()
+        self.zones_list.setSelectionMode(QListWidget.SingleSelection)
+        self.zones_list.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        for zone in self._cfg.get("zones", []):
+            item = QListWidgetItem(zone.get("name", "Zona"))
+            item.setData(Qt.UserRole, zone.get("id"))
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+            self.zones_list.addItem(item)
+        v.addWidget(self.zones_list, 1)
+        props = QGroupBox("Propiedades de zona")
+        g = QGridLayout(props)
+        self.zone_monitor_check = QCheckBox("Mostrar en modo monitor")
+        self.zone_alarm_enable = QCheckBox("Alarma de zona")
+        self.zone_alarm_min = QDoubleSpinBox(); self.zone_alarm_min.setDecimals(2); self.zone_alarm_min.setRange(-1e6, 1e6)
+        self.zone_alarm_max = QDoubleSpinBox(); self.zone_alarm_max.setDecimals(2); self.zone_alarm_max.setRange(-1e6, 1e6)
+        g.addWidget(self.zone_monitor_check, 0, 0, 1, 2)
+        g.addWidget(self.zone_alarm_enable, 1, 0, 1, 2)
+        g.addWidget(QLabel("Alarma min"), 2, 0); g.addWidget(self.zone_alarm_min, 2, 1)
+        g.addWidget(QLabel("Alarma max"), 3, 0); g.addWidget(self.zone_alarm_max, 3, 1)
+        v.addWidget(props)
+        btns = QHBoxLayout()
+        self.zone_add_btn = QPushButton("Añadir zona")
+        self.zone_del_btn = QPushButton("Eliminar zona")
+        self.zone_up_btn = QPushButton("Subir")
+        self.zone_down_btn = QPushButton("Bajar")
+        for b in [self.zone_add_btn, self.zone_del_btn, self.zone_up_btn, self.zone_down_btn]:
+            btns.addWidget(b)
+        btns.addStretch(1)
+        v.addLayout(btns)
+        self.tabs.addTab(w, "Zonas")
+        self.zone_add_btn.clicked.connect(self._add_zone)
+        self.zone_del_btn.clicked.connect(self._remove_zone)
+        self.zone_up_btn.clicked.connect(lambda: self._move_zone(-1))
+        self.zone_down_btn.clicked.connect(lambda: self._move_zone(1))
+        self.zones_list.itemChanged.connect(self._on_zones_changed)
+        self.zones_list.currentItemChanged.connect(self._load_zone_meta)
+        self.zone_monitor_check.toggled.connect(self._on_zone_meta_changed)
+        self.zone_alarm_enable.toggled.connect(self._on_zone_alarm_toggle)
+        self.zone_alarm_min.valueChanged.connect(self._on_zone_meta_changed)
+        self.zone_alarm_max.valueChanged.connect(self._on_zone_meta_changed)
+        if self.zones_list.count() > 0:
+            self.zones_list.setCurrentRow(0)
+
     def _build_vars_tab(self):
         w = QWidget(); v = QVBoxLayout(w)
         self.vars_scroll = QScrollArea(); self.vars_scroll.setWidgetResizable(True)
@@ -580,8 +970,140 @@ class SettingsDialog(QDialog):
         add_btn.clicked.connect(self._add_var_form)
         for var in self._cfg.get("variables", []):
             self._add_var_form(var)
+        self._refresh_var_zone_options()
         if self._selected_id:
             self._focus_selected()
+
+    def _current_zone_id(self):
+        item = self.zones_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _load_zone_meta(self, current, previous=None):
+        self._loading_zone_meta = True
+        zone_id = current.data(Qt.UserRole) if current else None
+        if zone_id and zone_id not in self._zone_meta:
+            self._zone_meta[zone_id] = {
+                "collapsed": False,
+                "monitor": False,
+                "alarm_enabled": False,
+                "alarm_min": None,
+                "alarm_max": None,
+            }
+        meta = self._zone_meta.get(zone_id, {})
+        self.zone_monitor_check.setChecked(bool(meta.get("monitor", False)))
+        self.zone_alarm_enable.setChecked(bool(meta.get("alarm_enabled", False)))
+        self.zone_alarm_min.setValue(float(meta.get("alarm_min") or 0.0))
+        self.zone_alarm_max.setValue(float(meta.get("alarm_max") or 0.0))
+        self._on_zone_alarm_toggle(self.zone_alarm_enable.isChecked())
+        self._loading_zone_meta = False
+
+    def _on_zone_alarm_toggle(self, enabled):
+        self.zone_alarm_min.setEnabled(enabled)
+        self.zone_alarm_max.setEnabled(enabled)
+        self._on_zone_meta_changed()
+
+    def _on_zone_meta_changed(self):
+        if self._loading_zone_meta:
+            return
+        zone_id = self._current_zone_id()
+        if not zone_id:
+            return
+        meta = self._zone_meta.setdefault(zone_id, {
+            "collapsed": False,
+            "monitor": False,
+            "alarm_enabled": False,
+            "alarm_min": None,
+            "alarm_max": None,
+        })
+        meta["monitor"] = bool(self.zone_monitor_check.isChecked())
+        meta["alarm_enabled"] = bool(self.zone_alarm_enable.isChecked())
+        meta["alarm_min"] = float(self.zone_alarm_min.value()) if meta["alarm_enabled"] else None
+        meta["alarm_max"] = float(self.zone_alarm_max.value()) if meta["alarm_enabled"] else None
+
+    def _current_zones(self):
+        zones = []
+        for i in range(self.zones_list.count()):
+            item = self.zones_list.item(i)
+            zone_id = item.data(Qt.UserRole)
+            if not zone_id:
+                zone_id = str(uuid.uuid4())
+                item.setData(Qt.UserRole, zone_id)
+            name = item.text().strip() or f"Zona {i + 1}"
+            if item.text().strip() != name:
+                item.setText(name)
+            meta = self._zone_meta.get(zone_id, {})
+            zones.append({
+                "id": zone_id,
+                "name": name,
+                "collapsed": bool(meta.get("collapsed", False)),
+                "monitor": bool(meta.get("monitor", False)),
+                "alarm_enabled": bool(meta.get("alarm_enabled", False)),
+                "alarm_min": meta.get("alarm_min"),
+                "alarm_max": meta.get("alarm_max"),
+            })
+        return zones
+
+    def _refresh_var_zone_options(self):
+        zones = self._current_zones()
+        default_id = zones[0]["id"] if zones else None
+        for i in range(self.vars_layout.count()):
+            w = self.vars_layout.itemAt(i).widget()
+            if isinstance(w, VariableForm):
+                w.set_zones(zones, default_zone_id=default_id)
+
+    def _add_zone(self):
+        zone_id = str(uuid.uuid4())
+        name = f"Zona {self.zones_list.count() + 1}"
+        item = QListWidgetItem(name)
+        item.setData(Qt.UserRole, zone_id)
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+        self.zones_list.addItem(item)
+        self._zone_meta[zone_id] = {
+            "collapsed": False,
+            "monitor": False,
+            "alarm_enabled": False,
+            "alarm_min": None,
+            "alarm_max": None,
+        }
+        self.zones_list.setCurrentItem(item)
+        self.zones_list.editItem(item)
+        self._refresh_var_zone_options()
+
+    def _remove_zone(self):
+        if self.zones_list.count() <= 1:
+            QMessageBox.warning(self, "Zonas", "Debe existir al menos una zona.")
+            return
+        row = self.zones_list.currentRow()
+        if row < 0:
+            return
+        item = self.zones_list.item(row)
+        zone_id = item.data(Qt.UserRole)
+        if QMessageBox.question(
+            self,
+            "Zonas",
+            "¿Eliminar la zona? Las variables se moverán a la zona principal.",
+        ) != QMessageBox.Yes:
+            return
+        self.zones_list.takeItem(row)
+        self._zone_meta.pop(zone_id, None)
+        self._refresh_var_zone_options()
+
+    def _move_zone(self, delta):
+        row = self.zones_list.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.zones_list.count():
+            return
+        item = self.zones_list.takeItem(row)
+        self.zones_list.insertItem(new_row, item)
+        self.zones_list.setCurrentRow(new_row)
+        self._refresh_var_zone_options()
+
+    def _on_zones_changed(self, item):
+        if not item.text().strip():
+            item.setText(f"Zona {self.zones_list.row(item) + 1}")
+        self._refresh_var_zone_options()
 
     def _build_log_tab(self):
         w = QWidget(); g = QGridLayout(w)
@@ -615,11 +1137,17 @@ class SettingsDialog(QDialog):
                 break
 
     def _add_var_form(self, var=None):
+        zones = self._current_zones()
+        default_zone_id = zones[0]["id"] if zones else None
         if not isinstance(var, dict):
             var = {
                 "id": str(uuid.uuid4()),
                 "name": f"Temperatura {self.vars_layout.count()+1}",
                 "unit": "°C",
+                "zone_id": default_zone_id,
+                "alarm_enabled": False,
+                "alarm_min": None,
+                "alarm_max": None,
                 "slave": 1,
                 "type": "holding",
                 "address": 0,
@@ -631,7 +1159,7 @@ class SettingsDialog(QDialog):
                 "poll_interval_ms": int(self.global_poll_spin.value()) if hasattr(self, 'global_poll_spin') else int(self._cfg.get("poll_interval_ms", 1000)),
                 "enabled": True,
             }
-        form = VariableForm(var)
+        form = VariableForm(var, zones=zones)
         form.delete_requested.connect(self._remove_var_form)
         self.vars_layout.addWidget(form)
 
@@ -662,6 +1190,8 @@ class SettingsDialog(QDialog):
                 "timeout": float(self.timeout_spin.value()),
             },
             "poll_interval_ms": int(self.global_poll_spin.value()),
+            "zones": self._current_zones(),
+            "ui": self._cfg.get("ui", {"density": "normal"}),
             "variables": [],
             "logging": {
                 "enabled": bool(self.log_enabled.isChecked()),
@@ -697,9 +1227,14 @@ class BasicPlot(QWidget):
         xs = []
         ys = []
         for s in self._series:
+            if not s.get('visible', True):
+                continue
             for x, y in s.get('points', []):
                 xs.append(float(x))
                 ys.append(float(y))
+            for th in [s.get('alarm_min'), s.get('alarm_max')]:
+                if th is not None:
+                    ys.append(float(th))
         if xs and ys:
             self._x_min = min(xs); self._x_max = max(xs)
             self._y_min = min(ys); self._y_max = max(ys)
@@ -740,8 +1275,22 @@ class BasicPlot(QWidget):
                 else:
                     dt = QDateTime.fromMSecsSinceEpoch(int(xv * 1000))
                 p.drawText(xpx - 30, top + plot_h + 18, dt.toString('HH:mm'))
+            # Threshold lines
+            for idx, s in enumerate(self._series):
+                if not s.get('visible', True):
+                    continue
+                color = self._colors[idx % len(self._colors)]
+                pen = QPen(color); pen.setWidth(1); pen.setStyle(Qt.DashLine)
+                p.setPen(pen)
+                for th in [s.get('alarm_min'), s.get('alarm_max')]:
+                    if th is None:
+                        continue
+                    ypx = top + plot_h - int((float(th) - self._y_min) / denom_y * plot_h)
+                    p.drawLine(left, ypx, left + plot_w, ypx)
             # Series lines
             for idx, s in enumerate(self._series):
+                if not s.get('visible', True):
+                    continue
                 pts = s.get('points', [])
                 if not pts:
                     continue
@@ -823,6 +1372,7 @@ class GraphsDialog(QDialog):
         self._pg_plot = None
         self._img_label = None
         self._basic_plot = None
+        self._series = []
         self.plot_area = QWidget()
         self._plot_area_layout = QVBoxLayout(self.plot_area)
         layout.addWidget(self.plot_area, 1)
@@ -853,11 +1403,17 @@ class GraphsDialog(QDialog):
     def _read_rows_for_var(self, var, start_dt, end_dt):
         rows = []
         if self.log_cfg.get("mode") == "per_variable":
+            vid = var.get("id")
             for d in self._iter_dates(start_dt, end_dt):
                 date_str = d.toString("yyyy-MM-dd")
                 name = self._safe(var.get("name", var.get("id", "var")))
-                path = os.path.join(self.log_folder, f"{name}_{date_str}.csv")
-                rows.extend(self._read_csv(path, var))
+                paths = set()
+                if vid:
+                    pattern = os.path.join(self.log_folder, f"*_{vid}_{date_str}.csv")
+                    paths.update(glob.glob(pattern))
+                paths.add(os.path.join(self.log_folder, f"{name}_{date_str}.csv"))
+                for path in sorted(paths):
+                    rows.extend(self._read_csv(path, var))
         else:
             for d in self._iter_dates(start_dt, end_dt):
                 date_str = d.toString("yyyy-MM-dd")
@@ -919,12 +1475,28 @@ class GraphsDialog(QDialog):
             if not rows:
                 continue
             points = [(r[0].timestamp(), r[1]) for r in rows]
-            series.append({"name": var.get("name"), "points": points})
+            values = [r[1] for r in rows]
+            if not values:
+                continue
+            avg = sum(values) / max(1, len(values))
+            alarm_min = var.get("alarm_min") if var.get("alarm_enabled") else None
+            alarm_max = var.get("alarm_max") if var.get("alarm_enabled") else None
+            series.append({
+                "name": var.get("name"),
+                "points": points,
+                "min": min(values),
+                "max": max(values),
+                "avg": avg,
+                "visible": True,
+                "alarm_min": alarm_min,
+                "alarm_max": alarm_max,
+            })
         if not series:
             QMessageBox.information(self, "Gráficos", "No hay datos en el rango seleccionado")
             return
+        self._series = series
         self._basic_plot = BasicPlot()
-        self._basic_plot.set_data(series)
+        self._basic_plot.set_data(self._series)
         self._plot_area_layout.addWidget(self._basic_plot)
         for i in reversed(range(self.legend_bar.count())):
             it = self.legend_bar.itemAt(i)
@@ -932,16 +1504,26 @@ class GraphsDialog(QDialog):
             if w:
                 w.setParent(None)
         colors = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b']
-        for idx, s in enumerate(series):
+        for idx, s in enumerate(self._series):
             swatch = QLabel()
             pm = QPixmap(10,10); pm.fill(QColor(colors[idx % len(colors)])); swatch.setPixmap(pm)
-            name = QLabel(s.get('name',''))
-            name.setStyleSheet("color:#334155;")
+            stats = f"min {s['min']:.2f} | avg {s['avg']:.2f} | max {s['max']:.2f}"
+            check = QCheckBox(f"{s.get('name','')} ({stats})")
+            check.setChecked(True)
+            check.toggled.connect(lambda checked, idx=idx: self._toggle_series(idx, checked))
             box = QHBoxLayout(); cont = QWidget(); cont.setLayout(box)
-            box.addWidget(swatch); box.addWidget(name)
+            box.addWidget(swatch); box.addWidget(check)
             box.setContentsMargins(0,0,12,0)
             self.legend_bar.addWidget(cont)
 
+    def _toggle_series(self, idx, checked):
+        if not hasattr(self, '_series') or not self._series:
+            return
+        if idx < 0 or idx >= len(self._series):
+            return
+        self._series[idx]["visible"] = bool(checked)
+        if self._basic_plot:
+            self._basic_plot.set_data(self._series)
 
     def _quick_range(self, hours=0, days=0):
         end = QDateTime.currentDateTime()
@@ -977,7 +1559,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TermoCali")
         self.resize(1100, 700)
         self.cfg = load_config()
+        if ensure_zones(self.cfg):
+            save_config(self.cfg)
         self.worker = None
+        self.last_values = {}
+        self.last_raw = {}
+        self.last_update = {}
+        self.alarm_state = {}
+        self.alarm_ack = set()
+        self.zone_alarm_state = {}
+        self.zone_alarm_ack = set()
+        self.zone_sections = {}
+        self.zone_vars_map = {}
+        self.var_map = {}
+        self.zone_stats = {}
+        self.global_last_update = None
+        self.monitor_mode = False
+        self.density_mode = self.cfg.get("ui", {}).get("density", "normal")
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
@@ -1062,6 +1660,29 @@ class MainWindow(QMainWindow):
         self.title_label = QLabel("TermoCali")
         self.title_label.setObjectName("Title")
         header_layout.addWidget(self.title_label)
+        conn_box = QWidget()
+        conn_layout = QVBoxLayout(conn_box)
+        conn_layout.setContentsMargins(8, 0, 8, 0)
+        conn_layout.setSpacing(2)
+        conn_row = QHBoxLayout()
+        conn_row.setContentsMargins(0, 0, 0, 0)
+        conn_row.setSpacing(6)
+        self.conn_dot = QLabel()
+        self.conn_dot.setFixedSize(10, 10)
+        self.conn_dot.setStyleSheet("background:#94a3b8;border-radius:5px;")
+        self.conn_label = QLabel("Desconectado")
+        self.conn_label.setStyleSheet("color:#e2e8f0;font-weight:600;")
+        self.conn_meta = QLabel("")
+        self.conn_meta.setStyleSheet("color:#e2e8f0;font-size:12px;")
+        conn_row.addWidget(self.conn_dot)
+        conn_row.addWidget(self.conn_label)
+        conn_row.addWidget(self.conn_meta)
+        conn_row.addStretch(1)
+        self.last_read_label = QLabel("Última lectura: --")
+        self.last_read_label.setStyleSheet("color:#e2e8f0;font-size:12px;")
+        conn_layout.addLayout(conn_row)
+        conn_layout.addWidget(self.last_read_label)
+        header_layout.addWidget(conn_box)
         header_layout.addStretch(1)
         self.h_connect_btn = QPushButton("Conectar")
         self.h_disconnect_btn = QPushButton("Desconectar")
@@ -1070,21 +1691,78 @@ class MainWindow(QMainWindow):
         self.h_add_btn = QPushButton("Añadir variable")
         self.h_save_btn = QPushButton("Guardar JSON")
         self.h_load_btn = QPushButton("Cargar JSON")
-        for b in [self.h_connect_btn, self.h_disconnect_btn, self.h_settings_btn, self.h_graphs_btn, self.h_add_btn, self.h_save_btn, self.h_load_btn]:
+        self.monitor_btn = QPushButton("Modo monitor")
+        self.monitor_btn.setCheckable(True)
+        for b in [self.h_connect_btn, self.h_disconnect_btn, self.h_settings_btn, self.h_graphs_btn, self.h_add_btn, self.h_save_btn, self.h_load_btn, self.monitor_btn]:
             header_layout.addWidget(b)
         self.h_disconnect_btn.setEnabled(False)
+        self.h_disconnect_btn.setEnabled(False)
         root.addWidget(self.header)
+        self.filter_bar = QFrame()
+        self.filter_bar.setStyleSheet("QFrame{background:#f8fafc;border-bottom:1px solid #e2e8f0;}")
+        filter_layout = QHBoxLayout(self.filter_bar)
+        filter_layout.setContentsMargins(12, 6, 12, 6)
+        filter_layout.setSpacing(10)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Buscar...")
+        self.zone_filter = QComboBox()
+        self.type_filter = QComboBox(); self.type_filter.addItems(["Todos", "holding", "input"])
+        self.alarm_filter = QComboBox(); self.alarm_filter.addItems(["Todos", "En alarma", "Sin alarma", "ACK"])
+        self.stale_filter = QComboBox(); self.stale_filter.addItems(["Todos", "Sin datos", "Actualizados"])
+        self.density_combo = QComboBox(); self.density_combo.addItems(["Normal", "Compacto"])
+        self.density_combo.setCurrentText("Compacto" if self.density_mode == "compact" else "Normal")
+        filter_layout.addWidget(QLabel("Buscar"))
+        filter_layout.addWidget(self.search_edit, 1)
+        filter_layout.addWidget(QLabel("Zona"))
+        filter_layout.addWidget(self.zone_filter)
+        filter_layout.addWidget(QLabel("Tipo"))
+        filter_layout.addWidget(self.type_filter)
+        filter_layout.addWidget(QLabel("Alarmas"))
+        filter_layout.addWidget(self.alarm_filter)
+        filter_layout.addWidget(QLabel("Estado"))
+        filter_layout.addWidget(self.stale_filter)
+        filter_layout.addWidget(QLabel("Densidad"))
+        filter_layout.addWidget(self.density_combo)
+        root.addWidget(self.filter_bar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.cards_container = QWidget()
-        self.cards_layout = QGridLayout(self.cards_container)
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(12, 12, 12, 12)
         self.cards_layout.setSpacing(12)
+        self.cards_layout.setAlignment(Qt.AlignTop)
         self.scroll.setWidget(self.cards_container)
-        root.addWidget(self.scroll, 1)
+        self.alarm_panel = QFrame()
+        self.alarm_panel.setStyleSheet("QFrame{background:#ffffff;border-left:1px solid #e2e8f0;}")
+        self.alarm_panel.setMinimumWidth(260)
+        alarm_layout = QVBoxLayout(self.alarm_panel)
+        alarm_layout.setContentsMargins(10, 10, 10, 10)
+        alarm_layout.setSpacing(8)
+        self.alarms_title = QLabel("Alarmas (0)")
+        self.alarms_title.setStyleSheet("font-weight:700;color:#0f172a;")
+        self.alarms_list = QListWidget()
+        self.alarms_list.setSpacing(4)
+        alarm_layout.addWidget(self.alarms_title)
+        alarm_layout.addWidget(self.alarms_list, 1)
+        content_wrap = QWidget()
+        content_layout = QHBoxLayout(content_wrap)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(self.scroll, 1)
+        content_layout.addWidget(self.alarm_panel)
+        root.addWidget(content_wrap, 1)
         self.status_label = QLabel("Listo")
         root.addWidget(self.status_label)
         self.cards = {}
+        self._refresh_zone_filter()
         self._rebuild_cards()
+        self.search_edit.textChanged.connect(self.on_filters_changed)
+        self.zone_filter.currentIndexChanged.connect(self.on_filters_changed)
+        self.type_filter.currentIndexChanged.connect(self.on_filters_changed)
+        self.alarm_filter.currentIndexChanged.connect(self.on_filters_changed)
+        self.stale_filter.currentIndexChanged.connect(self.on_filters_changed)
+        self.density_combo.currentTextChanged.connect(self.on_density_changed)
+        self.monitor_btn.toggled.connect(self.set_monitor_mode)
         self.connect_btn.clicked.connect(self.on_connect)
         self.disconnect_btn.clicked.connect(self.on_disconnect)
         self.add_btn.clicked.connect(self.on_add_variable)
@@ -1097,6 +1775,10 @@ class MainWindow(QMainWindow):
         self.h_add_btn.clicked.connect(self.on_add_variable)
         self.h_save_btn.clicked.connect(self.on_save_config)
         self.h_load_btn.clicked.connect(self.on_load_config)
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.refresh_status)
+        self.status_timer.start(1000)
+        self._update_connection_indicator("disconnected")
 
     def _refresh_ports(self):
         try:
@@ -1116,18 +1798,303 @@ class MainWindow(QMainWindow):
             "timeout": float(self.timeout_spin.value()),
         }
 
+    def _refresh_zone_filter(self):
+        if not hasattr(self, "zone_filter"):
+            return
+        self.zone_filter.blockSignals(True)
+        self.zone_filter.clear()
+        self.zone_filter.addItem("Todas", None)
+        for zone in self.cfg.get("zones", []):
+            self.zone_filter.addItem(zone.get("name", "Zona"), zone.get("id"))
+        self.zone_filter.blockSignals(False)
+
+    def on_zone_toggled(self, zone_id, collapsed):
+        updated = False
+        for zone in self.cfg.get("zones", []):
+            if zone.get("id") == zone_id:
+                if zone.get("collapsed") != bool(collapsed):
+                    zone["collapsed"] = bool(collapsed)
+                    updated = True
+                break
+        if updated:
+            save_config(self.cfg)
+
+    def on_filters_changed(self):
+        self._rebuild_cards()
+
+    def on_density_changed(self, text):
+        self.density_mode = "compact" if text == "Compacto" else "normal"
+        self.cfg.setdefault("ui", {})["density"] = self.density_mode
+        save_config(self.cfg)
+        self._rebuild_cards()
+
+    def set_monitor_mode(self, enabled):
+        self.monitor_mode = bool(enabled)
+        self.monitor_btn.setText("Salir monitor" if self.monitor_mode else "Modo monitor")
+        for b in [self.h_settings_btn, self.h_graphs_btn, self.h_add_btn, self.h_save_btn, self.h_load_btn]:
+            b.setVisible(not self.monitor_mode)
+        self.filter_bar.setVisible(not self.monitor_mode)
+        self._rebuild_cards()
+
+    def _filters_active(self):
+        if not hasattr(self, "search_edit"):
+            return False
+        if self.search_edit.text().strip():
+            return True
+        if self.zone_filter.currentData():
+            return True
+        if self.type_filter.currentText() != "Todos":
+            return True
+        if self.alarm_filter.currentText() != "Todos":
+            return True
+        if self.stale_filter.currentText() != "Todos":
+            return True
+        return False
+
+    def _matches_filters(self, var):
+        if not hasattr(self, "search_edit"):
+            return True
+        text = self.search_edit.text().strip().lower()
+        if text and text not in str(var.get("name", "")).lower():
+            return False
+        zone_id = self.zone_filter.currentData()
+        if zone_id and var.get("zone_id") != zone_id:
+            return False
+        typ = self.type_filter.currentText()
+        if typ != "Todos" and var.get("type") != typ:
+            return False
+        alarm_filter = self.alarm_filter.currentText()
+        vid = var.get("id")
+        in_alarm = self.alarm_state.get(vid, False)
+        if alarm_filter == "En alarma" and not in_alarm:
+            return False
+        if alarm_filter == "Sin alarma" and in_alarm:
+            return False
+        if alarm_filter == "ACK" and not (in_alarm and vid in self.alarm_ack):
+            return False
+        stale_filter = self.stale_filter.currentText()
+        if stale_filter != "Todos":
+            stale = self._is_stale(var, datetime.now())
+            if stale_filter == "Sin datos" and not stale:
+                return False
+            if stale_filter == "Actualizados" and stale:
+                return False
+        return True
+
+    def _stale_threshold(self, var):
+        interval = int(var.get("poll_interval_ms", self.cfg.get("poll_interval_ms", 1000))) / 1000.0
+        return max(5.0, interval * 3.0)
+
+    def _is_stale(self, var, now):
+        last = self.last_update.get(var.get("id"))
+        if not last:
+            return True
+        return (now - last).total_seconds() > self._stale_threshold(var)
+
+    def _format_last_update(self, last_dt, now):
+        if not last_dt:
+            return "Sin lecturas"
+        delta = int((now - last_dt).total_seconds())
+        return f"Actualizado: {last_dt.strftime('%H:%M:%S')} (hace {delta}s)"
+
+    def _evaluate_var_alarm(self, var, value):
+        if not var.get("alarm_enabled"):
+            return False
+        min_v = var.get("alarm_min")
+        max_v = var.get("alarm_max")
+        if min_v is not None and value < min_v:
+            return True
+        if max_v is not None and value > max_v:
+            return True
+        return False
+
+    def _evaluate_zone_alarm(self, zone, avg_value):
+        if not zone.get("alarm_enabled") or avg_value is None:
+            return False
+        min_v = zone.get("alarm_min")
+        max_v = zone.get("alarm_max")
+        if min_v is not None and avg_value < min_v:
+            return True
+        if max_v is not None and avg_value > max_v:
+            return True
+        return False
+
+    def _update_zone_summaries(self, now):
+        self.zone_stats = {}
+        for zone in self.cfg.get("zones", []):
+            zone_id = zone.get("id")
+            var_ids = self.zone_vars_map.get(zone_id, [])
+            values = []
+            active = 0
+            units = set()
+            for vid in var_ids:
+                var = self.var_map.get(vid)
+                if not var:
+                    continue
+                unit = var.get("unit")
+                if unit:
+                    units.add(unit)
+                last_dt = self.last_update.get(vid)
+                if last_dt and not self._is_stale(var, now):
+                    active += 1
+                    if vid in self.last_values:
+                        values.append(float(self.last_values.get(vid)))
+            total = len(var_ids)
+            avg = None
+            mn = None
+            mx = None
+            unit_label = ""
+            if len(units) == 1:
+                unit_label = units.pop()
+            if values:
+                avg = sum(values) / max(1, len(values))
+                mn = min(values)
+                mx = max(values)
+                summary = f"Activos {active}/{total} | Prom {avg:.2f}{unit_label} | Min {mn:.2f}{unit_label} | Max {mx:.2f}{unit_label}"
+            else:
+                summary = f"Activos {active}/{total} | Sin datos"
+            self.zone_stats[zone_id] = {
+                "avg": avg,
+                "min": mn,
+                "max": mx,
+                "active": active,
+                "total": total,
+                "unit": unit_label,
+            }
+            zone_alarm = self._evaluate_zone_alarm(zone, avg)
+            self.zone_alarm_state[zone_id] = zone_alarm
+            if not zone_alarm:
+                self.zone_alarm_ack.discard(zone_id)
+            alarm_count = sum(1 for vid in var_ids if self.alarm_state.get(vid))
+            section = self.zone_sections.get(zone_id)
+            if section:
+                section.set_summary(summary, alarm_count=alarm_count, zone_alarm=zone_alarm)
+
+    def _update_alarm_list(self):
+        alarms = []
+        for vid, var in self.var_map.items():
+            if not self.alarm_state.get(vid):
+                continue
+            value = self.last_values.get(vid)
+            unit = var.get("unit", "")
+            min_v = var.get("alarm_min")
+            max_v = var.get("alarm_max")
+            detail = ""
+            if value is None:
+                detail = "Sin valor"
+            elif min_v is not None and value < min_v:
+                detail = f"{value:.2f}{unit} < {min_v:.2f}{unit}"
+            elif max_v is not None and value > max_v:
+                detail = f"{value:.2f}{unit} > {max_v:.2f}{unit}"
+            else:
+                detail = f"{value:.2f}{unit}"
+            alarms.append((vid, var.get("name", "Variable"), detail, vid in self.alarm_ack))
+        for zone in self.cfg.get("zones", []):
+            zid = zone.get("id")
+            if not self.zone_alarm_state.get(zid):
+                continue
+            stats = self.zone_stats.get(zid, {})
+            avg = stats.get("avg")
+            unit = stats.get("unit", "")
+            min_v = zone.get("alarm_min")
+            max_v = zone.get("alarm_max")
+            detail = "Sin datos"
+            if avg is not None:
+                detail = f"Prom {avg:.2f}{unit}"
+                if min_v is not None and avg < min_v:
+                    detail = f"{avg:.2f}{unit} < {min_v:.2f}{unit}"
+                elif max_v is not None and avg > max_v:
+                    detail = f"{avg:.2f}{unit} > {max_v:.2f}{unit}"
+            alarms.append((f"zone:{zid}", f"Zona: {zone.get('name','Zona')}", detail, zid in self.zone_alarm_ack))
+        self.alarms_list.clear()
+        for alarm_id, title, detail, acked in alarms:
+            item = QListWidgetItem()
+            row = AlarmRow(alarm_id, title, detail, acked=acked)
+            row.ack_clicked.connect(self.on_alarm_ack)
+            item.setSizeHint(row.sizeHint())
+            self.alarms_list.addItem(item)
+            self.alarms_list.setItemWidget(item, row)
+        self.alarms_title.setText(f"Alarmas ({len(alarms)})")
+
+    def _cleanup_state(self):
+        valid_ids = {v.get("id") for v in self.cfg.get("variables", [])}
+        self.last_values = {k: v for k, v in self.last_values.items() if k in valid_ids}
+        self.last_raw = {k: v for k, v in self.last_raw.items() if k in valid_ids}
+        self.last_update = {k: v for k, v in self.last_update.items() if k in valid_ids}
+        self.alarm_state = {k: v for k, v in self.alarm_state.items() if k in valid_ids}
+        self.alarm_ack = {k for k in self.alarm_ack if k in valid_ids}
+        valid_zones = {z.get("id") for z in self.cfg.get("zones", [])}
+        self.zone_alarm_state = {k: v for k, v in self.zone_alarm_state.items() if k in valid_zones}
+        self.zone_alarm_ack = {k for k in self.zone_alarm_ack if k in valid_zones}
+
+    def on_alarm_ack(self, alarm_id):
+        if alarm_id.startswith("zone:"):
+            zid = alarm_id.split(":", 1)[1]
+            self.zone_alarm_ack.add(zid)
+        else:
+            self.alarm_ack.add(alarm_id)
+        self._update_alarm_list()
+        self.refresh_status()
+
+    def refresh_status(self):
+        now = datetime.now()
+        for vid, card in self.cards.items():
+            var = self.var_map.get(vid)
+            if not var:
+                continue
+            stale = self._is_stale(var, now)
+            in_alarm = self.alarm_state.get(vid, False)
+            acked = vid in self.alarm_ack
+            card.set_state(stale=stale, in_alarm=in_alarm, acked=acked)
+            card.set_last_update(self._format_last_update(self.last_update.get(vid), now))
+        self._update_zone_summaries(now)
+        self._update_alarm_list()
+        if self.global_last_update:
+            delta = int((now - self.global_last_update).total_seconds())
+            self.last_read_label.setText(f"Última lectura: hace {delta}s")
+        else:
+            self.last_read_label.setText("Última lectura: --")
+
+    def _update_connection_indicator(self, state, message=None):
+        if state == "connecting":
+            self.conn_dot.setStyleSheet("background:#f59e0b;border-radius:5px;")
+            self.conn_label.setText("Conectando")
+        elif state == "connected":
+            self.conn_dot.setStyleSheet("background:#22c55e;border-radius:5px;")
+            self.conn_label.setText("Conectado")
+        elif state == "error":
+            self.conn_dot.setStyleSheet("background:#ef4444;border-radius:5px;")
+            self.conn_label.setText("Error")
+        else:
+            self.conn_dot.setStyleSheet("background:#94a3b8;border-radius:5px;")
+            self.conn_label.setText("Desconectado")
+        ser = self.cfg.get("serial", {})
+        port = ser.get("port", "")
+        baud = ser.get("baudrate", "")
+        self.conn_meta.setText(f"{port} @ {baud}" if port else "")
+        if message:
+            self.status_label.setText(message)
+
     def _rebuild_cards(self):
         for i in reversed(range(self.cards_layout.count())):
             w = self.cards_layout.itemAt(i).widget()
             if w:
                 w.setParent(None)
         self.cards.clear()
+        self.zone_sections.clear()
+        self.zone_vars_map.clear()
+        dirty = ensure_zones(self.cfg)
         vars_list = self.cfg.get("variables", [])
         if not vars_list:
+            default_zone_id = self.cfg.get("zones", [{}])[0].get("id")
             sample = {
                 "id": str(uuid.uuid4()),
                 "name": "Temperatura 1",
                 "unit": "°C",
+                "zone_id": default_zone_id,
+                "alarm_enabled": False,
+                "alarm_min": None,
+                "alarm_max": None,
                 "slave": 1,
                 "type": "holding",
                 "address": 0,
@@ -1140,24 +2107,63 @@ class MainWindow(QMainWindow):
                 "enabled": True,
             }
             self.cfg["variables"] = [sample]
-            save_config(self.cfg)
+            dirty = True
             vars_list = self.cfg.get("variables", [])
-        cols = 3
-        dirty = False
-        for idx, var in enumerate(vars_list):
+        zones = self.cfg.get("zones", [])
+        monitor_zones = [z for z in zones if z.get("monitor")]
+        self.var_map = {}
+        vars_by_zone = {z.get("id"): [] for z in zones}
+        for var in vars_list:
             vid = var.get("id")
             if not vid:
                 vid = str(uuid.uuid4())
                 var["id"] = vid
                 dirty = True
-            card = VariableCard(var)
-            r = idx // cols
-            c = idx % cols
-            self.cards_layout.addWidget(card, r, c)
-            self.cards[vid] = card
-            card.config_btn.clicked.connect(lambda _, vid=vid: self.on_open_settings(vid))
+            self.var_map[vid] = var
+            zone_id = var.get("zone_id")
+            if zone_id not in vars_by_zone:
+                zone_id = zones[0].get("id") if zones else None
+                var["zone_id"] = zone_id
+                dirty = True
+            vars_by_zone.setdefault(zone_id, []).append(var)
+        self.zone_vars_map = {zid: [v.get("id") for v in vlist] for zid, vlist in vars_by_zone.items()}
+        zone_filter_id = self.zone_filter.currentData() if hasattr(self, "zone_filter") else None
+        filters_active = self._filters_active()
+        cols = 2 if self.monitor_mode else 3
+        for zone in zones:
+            zone_id = zone.get("id")
+            if self.monitor_mode and monitor_zones and not zone.get("monitor"):
+                continue
+            if zone_filter_id and zone_id != zone_filter_id:
+                continue
+            zone_vars_all = vars_by_zone.get(zone_id, [])
+            zone_vars = [v for v in zone_vars_all if self._matches_filters(v)]
+            if not zone_vars and (filters_active or self.monitor_mode or zone_filter_id):
+                continue
+            zone_title = zone.get("name", "Zona")
+            section = CollapsibleSection(zone_id, zone_title, collapsed=bool(zone.get("collapsed", False)))
+            section.toggled.connect(self.on_zone_toggled)
+            self.zone_sections[zone_id] = section
+            if not zone_vars:
+                empty = QLabel("Sin variables")
+                empty.setStyleSheet("color:#94a3b8;padding:4px 8px;")
+                section.content_layout.addWidget(empty, 0, 0)
+            for idx, var in enumerate(zone_vars):
+                vid = var.get("id")
+                card = VariableCard(var)
+                card.set_density(self.density_mode, monitor=self.monitor_mode)
+                card.config_btn.setVisible(not self.monitor_mode)
+                if vid in self.last_values:
+                    card.set_value(self.last_values.get(vid), self.last_raw.get(vid))
+                r = idx // cols
+                c = idx % cols
+                section.content_layout.addWidget(card, r, c)
+                self.cards[vid] = card
+                card.config_btn.clicked.connect(lambda _, vid=vid: self.on_open_settings(vid))
+            self.cards_layout.addWidget(section)
         if dirty:
             save_config(self.cfg)
+        self.refresh_status()
 
     def on_connect(self):
         save_config(self.cfg)
@@ -1168,15 +2174,18 @@ class MainWindow(QMainWindow):
             self.cfg.get("variables", []),
             self.cfg.get("logging", {})
         )
+        self.worker.connected.connect(self.on_worker_connected)
         self.worker.value_updated.connect(self.on_value_update)
         self.worker.error.connect(self.on_var_error)
         self.worker.status.connect(self.on_status)
+        self.global_last_update = None
         self.worker.start()
-        self.status_label.setText("Conectado")
+        self.status_label.setText("Conectando...")
+        self._update_connection_indicator("connecting")
         self.connect_btn.setEnabled(False)
-        self.disconnect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
         self.h_connect_btn.setEnabled(False)
-        self.h_disconnect_btn.setEnabled(True)
+        self.h_disconnect_btn.setEnabled(False)
 
     def on_disconnect(self):
         if self.worker:
@@ -1187,10 +2196,33 @@ class MainWindow(QMainWindow):
                 pass
             self.worker = None
         self.status_label.setText("Desconectado")
+        self._update_connection_indicator("disconnected")
+        self.last_read_label.setText("Última lectura: --")
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
         self.h_connect_btn.setEnabled(True)
         self.h_disconnect_btn.setEnabled(False)
+
+    def on_worker_connected(self, ok, message):
+        if not ok:
+            self.status_label.setText(message or "No se pudo conectar")
+            self._update_connection_indicator("error", message)
+            self.connect_btn.setEnabled(True)
+            self.disconnect_btn.setEnabled(False)
+            self.h_connect_btn.setEnabled(True)
+            self.h_disconnect_btn.setEnabled(False)
+            try:
+                if self.worker:
+                    self.worker.stop()
+                    self.worker.wait(2000)
+            except Exception:
+                pass
+            self.worker = None
+            return
+        self.status_label.setText("Conectado")
+        self._update_connection_indicator("connected")
+        self.disconnect_btn.setEnabled(True)
+        self.h_disconnect_btn.setEnabled(True)
 
     def on_add_variable(self):
         self.on_open_settings()
@@ -1243,6 +2275,12 @@ class MainWindow(QMainWindow):
             logging_changed = json.dumps(self.cfg.get("logging", {}), sort_keys=True) != json.dumps(new_cfg.get("logging", {}), sort_keys=True)
             was_running = self.worker.isRunning() if self.worker else False
             self.cfg = new_cfg
+            ensure_zones(self.cfg)
+            self._cleanup_state()
+            self._refresh_zone_filter()
+            self.density_mode = self.cfg.get("ui", {}).get("density", self.density_mode)
+            if hasattr(self, "density_combo"):
+                self.density_combo.setCurrentText("Compacto" if self.density_mode == "compact" else "Normal")
             save_config(self.cfg)
             self._rebuild_cards()
             if self.worker:
@@ -1254,6 +2292,7 @@ class MainWindow(QMainWindow):
                     self.worker.set_variables(self.cfg.get("variables", []))
                     if logging_changed:
                         self.worker.set_logging(self.cfg.get("logging", {}))
+            self._update_connection_indicator("connected" if (self.worker and self.worker.isRunning()) else "disconnected")
             self.status_label.setText("Configuración aplicada")
 
     def on_open_graphs(self):
@@ -1281,24 +2320,47 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "r") as f:
                 self.cfg = json.load(f)
+            ensure_zones(self.cfg)
+            self._cleanup_state()
+            self._refresh_zone_filter()
+            self.density_mode = self.cfg.get("ui", {}).get("density", self.density_mode)
+            if hasattr(self, "density_combo"):
+                self.density_combo.setCurrentText("Compacto" if self.density_mode == "compact" else "Normal")
             save_config(self.cfg)
             self._rebuild_cards()
             if self.worker:
                 self.worker.set_variables(self.cfg.get("variables", []))
                 self.worker.set_logging(self.cfg.get("logging", {}))
             self.status_label.setText(f"Cargado: {os.path.basename(path)}")
+            self._update_connection_indicator("connected" if (self.worker and self.worker.isRunning()) else "disconnected")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
     def on_value_update(self, vid, value, raw):
+        now = datetime.now()
+        self.last_values[vid] = float(value)
+        self.last_raw[vid] = raw
+        self.last_update[vid] = now
+        self.global_last_update = now
+        var = self.var_map.get(vid)
+        if var:
+            in_alarm = self._evaluate_var_alarm(var, float(value))
+            self.alarm_state[vid] = in_alarm
+            if not in_alarm:
+                self.alarm_ack.discard(vid)
         card = self.cards.get(vid)
         if card:
             card.set_value(value, raw)
+            if var:
+                stale = self._is_stale(var, now)
+                card.set_state(stale=stale, in_alarm=self.alarm_state.get(vid, False), acked=vid in self.alarm_ack)
+                card.set_last_update(self._format_last_update(self.last_update.get(vid), now))
 
     def on_var_error(self, vid, message):
         card = self.cards.get(vid)
         if card:
             card.set_error()
+        self.last_update.pop(vid, None)
         self.status_label.setText(message)
 
     def on_status(self, message):
