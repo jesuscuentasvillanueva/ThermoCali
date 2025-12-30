@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import sys
 import os
 import json
@@ -520,6 +520,8 @@ class PollingWorker(QThread):
     error = pyqtSignal(str, str)
     status = pyqtSignal(str)
     connected = pyqtSignal(bool, str)
+    BLOCK_START = 104
+    BLOCK_COUNT = 8
 
     def __init__(self, serial_cfg, variables, logging_cfg=None):
         super().__init__()
@@ -530,6 +532,9 @@ class PollingWorker(QThread):
         self.next_due = {}
         self.logging_cfg = logging_cfg or {}
         self.logger = CSVLogger(self.logging_cfg)
+        self.block_offsets = {}
+        self.block_retry = {}
+        self.block_cache = {}
 
     def set_variables(self, variables):
         self.variables = list(variables)
@@ -537,20 +542,36 @@ class PollingWorker(QThread):
             self.logger.set_variables_snapshot(self.variables)
         except Exception:
             pass
+        self.block_offsets = {}
+        self.block_retry = {}
+        self.block_cache = {}
 
     def set_logging(self, logging_cfg):
         self.logging_cfg = logging_cfg or {}
         self.logger.update_config(self.logging_cfg)
 
     def run(self):
-        self.client = ModbusSerialClient(
-            port=self.serial_cfg.get("port"),
-            baudrate=int(self.serial_cfg.get("baudrate", 9600)),
-            parity=self.serial_cfg.get("parity", "N"),
-            stopbits=int(self.serial_cfg.get("stopbits", 1)),
-            bytesize=int(self.serial_cfg.get("bytesize", 8)),
-            timeout=float(self.serial_cfg.get("timeout", 1.0)),
-        )
+        cfg_timeout = float(self.serial_cfg.get("timeout", 1.0))
+        timeout = min(cfg_timeout, 0.1)
+        client_kwargs = {
+            "port": self.serial_cfg.get("port"),
+            "baudrate": int(self.serial_cfg.get("baudrate", 9600)),
+            "parity": self.serial_cfg.get("parity", "N"),
+            "stopbits": int(self.serial_cfg.get("stopbits", 1)),
+            "bytesize": int(self.serial_cfg.get("bytesize", 8)),
+            "timeout": timeout,
+        }
+        try:
+            self.client = ModbusSerialClient(**client_kwargs, retries=0, retry_on_empty=False)
+        except TypeError:
+            self.client = ModbusSerialClient(**client_kwargs)
+            try:
+                if hasattr(self.client, "retries"):
+                    self.client.retries = 0
+                if hasattr(self.client, "retry_on_empty"):
+                    self.client.retry_on_empty = False
+            except Exception:
+                pass
         try:
             if not self.client.connect():
                 message = f"No se pudo conectar a {self.serial_cfg.get('port')}"
@@ -560,13 +581,17 @@ class PollingWorker(QThread):
             self.connected.emit(False, str(e))
             return
         self.connected.emit(True, "")
+        self._build_block_map(self.variables)
         self.running = True
         while self.running:
             now = time.monotonic()
             vars_snapshot = list(self.variables)
             idle = True
             next_wake = None
-            groups = {}
+            block_groups = {}
+            single_groups = {}
+            block_start = self.BLOCK_START
+            block_end = self.BLOCK_START + self.BLOCK_COUNT - 1
             for var in vars_snapshot:
                 if not var.get("enabled", True):
                     continue
@@ -578,13 +603,51 @@ class PollingWorker(QThread):
                         next_wake = due
                     continue
                 idle = False
-                key = (int(var.get("slave",1)), var.get("type","holding"), int(var.get("address",0)))
-                lst = groups.get(key)
-                if lst is None:
-                    lst = []
-                    groups[key] = lst
-                lst.append(var)
-            for key, vlist in groups.items():
+                slave = int(var.get("slave", 1))
+                typ = var.get("type", "holding")
+                addr = int(var.get("address", 0))
+                if block_start <= addr <= block_end:
+                    key = (slave, typ)
+                    lst = block_groups.get(key)
+                    if lst is None:
+                        lst = []
+                        block_groups[key] = lst
+                    lst.append(var)
+                else:
+                    key = (slave, typ, addr)
+                    lst = single_groups.get(key)
+                    if lst is None:
+                        lst = []
+                        single_groups[key] = lst
+                    lst.append(var)
+            for key, vlist in block_groups.items():
+                slave, typ = key
+                try:
+                    regs = self._read_block_for_slave(slave, typ)
+                    for var in vlist:
+                        vid = var.get("id")
+                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
+                        addr = int(var.get("address", 0))
+                        idx = addr - block_start
+                        if idx < 0 or idx >= len(regs):
+                            self.error.emit(vid, "Direccion fuera de bloque")
+                            self.next_due[vid] = time.monotonic() + interval
+                            continue
+                        reg = regs[idx]
+                        value = self.convert_value(var, reg)
+                        self.value_updated.emit(vid, value, reg)
+                        try:
+                            self.logger.log(var, reg, value)
+                        except Exception:
+                            pass
+                        self.next_due[vid] = time.monotonic() + interval
+                except Exception as e:
+                    for var in vlist:
+                        vid = var.get("id")
+                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
+                        self.error.emit(vid, str(e))
+                        self.next_due[vid] = time.monotonic() + interval
+            for key, vlist in single_groups.items():
                 slave, typ, addr = key
                 try:
                     reg = self.read_raw(slave, typ, addr)
@@ -619,6 +682,73 @@ class PollingWorker(QThread):
     def stop(self):
         self.running = False
 
+    def _build_block_map(self, vars_list):
+        self.block_offsets = {}
+        self.block_retry = {}
+        self.block_cache = {}
+        block_start = self.BLOCK_START
+        block_end = block_start + self.BLOCK_COUNT - 1
+        pairs = set()
+        for var in vars_list or []:
+            if not var.get("enabled", True):
+                continue
+            addr = int(var.get("address", 0))
+            if addr < block_start or addr > block_end:
+                continue
+            slave = int(var.get("slave", 1))
+            typ = var.get("type", "holding")
+            pairs.add((slave, typ))
+        for key in sorted(pairs):
+            slave, typ = key
+            offset, regs = self._detect_block_offset(slave, typ)
+            if offset is None:
+                self.block_retry[key] = time.monotonic() + 5.0
+                continue
+            self.block_offsets[key] = offset
+            if regs:
+                self.block_cache[key] = regs
+
+    def _detect_block_offset(self, slave, typ):
+        for offset in (0, 1):
+            start = self.BLOCK_START - offset
+            if start < 0:
+                continue
+            try:
+                regs = self.read_block(slave, typ, start, self.BLOCK_COUNT)
+                return offset, regs
+            except Exception:
+                continue
+        return None, None
+
+    def _read_block_for_slave(self, slave, typ):
+        key = (slave, typ)
+        cached = self.block_cache.pop(key, None)
+        if cached is not None:
+            return cached
+        offset = self.block_offsets.get(key)
+        now = time.monotonic()
+        if offset is None:
+            retry_at = self.block_retry.get(key, 0)
+            if now < retry_at:
+                raise RuntimeError("Sin mapa")
+            offset, regs = self._detect_block_offset(slave, typ)
+            if offset is None:
+                self.block_retry[key] = now + 5.0
+                raise RuntimeError("Sin respuesta")
+            self.block_offsets[key] = offset
+            return regs
+        start = self.BLOCK_START - offset
+        try:
+            return self.read_block(slave, typ, start, self.BLOCK_COUNT)
+        except Exception:
+            alt = 1 - offset
+            try:
+                regs = self.read_block(slave, typ, self.BLOCK_START - alt, self.BLOCK_COUNT)
+                self.block_offsets[key] = alt
+                return regs
+            except Exception as e:
+                raise e
+
     def read_var(self, var):
         addr = int(var.get("address", 0))
         slave = int(var.get("slave", 1))
@@ -635,6 +765,18 @@ class PollingWorker(QThread):
         if hasattr(resp, "isError") and resp.isError():
             raise RuntimeError(str(resp))
         return int(resp.registers[0])
+
+    def read_block(self, slave, typ, addr, count):
+        if typ == "holding":
+            resp = self.client.read_holding_registers(address=addr, count=count, slave=slave)
+        else:
+            resp = self.client.read_input_registers(address=addr, count=count, slave=slave)
+        if hasattr(resp, "isError") and resp.isError():
+            raise RuntimeError(str(resp))
+        regs = getattr(resp, "registers", None)
+        if not regs or len(regs) < count:
+            raise RuntimeError("Respuesta incompleta")
+        return [int(r) for r in regs]
 
     def convert_value(self, var, reg):
         dtype = var.get("data_type", "uint16")
