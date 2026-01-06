@@ -589,7 +589,6 @@ class PollingWorker(QThread):
             idle = True
             next_wake = None
             block_groups = {}
-            single_groups = {}
             block_start = self.BLOCK_START
             block_end = self.BLOCK_START + self.BLOCK_COUNT - 1
             for var in vars_snapshot:
@@ -602,11 +601,11 @@ class PollingWorker(QThread):
                     if next_wake is None or due < next_wake:
                         next_wake = due
                     continue
-                idle = False
                 slave = int(var.get("slave", 1))
                 typ = var.get("type", "holding")
                 addr = int(var.get("address", 0))
                 if block_start <= addr <= block_end:
+                    idle = False
                     key = (slave, typ)
                     lst = block_groups.get(key)
                     if lst is None:
@@ -614,12 +613,7 @@ class PollingWorker(QThread):
                         block_groups[key] = lst
                     lst.append(var)
                 else:
-                    key = (slave, typ, addr)
-                    lst = single_groups.get(key)
-                    if lst is None:
-                        lst = []
-                        single_groups[key] = lst
-                    lst.append(var)
+                    self.next_due[vid] = time.monotonic() + interval
             for key, vlist in block_groups.items():
                 slave, typ = key
                 try:
@@ -634,26 +628,6 @@ class PollingWorker(QThread):
                             self.next_due[vid] = time.monotonic() + interval
                             continue
                         reg = regs[idx]
-                        value = self.convert_value(var, reg)
-                        self.value_updated.emit(vid, value, reg)
-                        try:
-                            self.logger.log(var, reg, value)
-                        except Exception:
-                            pass
-                        self.next_due[vid] = time.monotonic() + interval
-                except Exception as e:
-                    for var in vlist:
-                        vid = var.get("id")
-                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
-                        self.error.emit(vid, str(e))
-                        self.next_due[vid] = time.monotonic() + interval
-            for key, vlist in single_groups.items():
-                slave, typ, addr = key
-                try:
-                    reg = self.read_raw(slave, typ, addr)
-                    for var in vlist:
-                        vid = var.get("id")
-                        interval = int(var.get("poll_interval_ms", 1000)) / 1000.0
                         value = self.convert_value(var, reg)
                         self.value_updated.emit(vid, value, reg)
                         try:
